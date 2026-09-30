@@ -1,0 +1,5 @@
+aiogram==3.22.0
+Telethon==1.43.0
+python-dotenv==1.1.1
+qrcode==8.2
+Pillow==11.3.0
