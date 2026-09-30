@@ -13,9 +13,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    BufferedInputFile,
-    ReplyKeyboardMarkup,
-    KeyboardButton
+    BufferedInputFile
 )
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -26,8 +24,6 @@ from telethon.errors import RPCError, SessionPasswordNeededError
 
 import qrcode
 
-from aiohttp import web
-
 
 # =========================================================
 # ENVIRONMENT
@@ -36,22 +32,18 @@ from aiohttp import web
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-API_ID_RAW = os.getenv("API_ID", "").strip()
+API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
+
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing")
 
-if not API_ID_RAW:
+if not API_ID:
     raise RuntimeError("API_ID missing")
 
 if not API_HASH:
     raise RuntimeError("API_HASH missing")
-
-try:
-    API_ID = int(API_ID_RAW)
-except ValueError:
-    raise RuntimeError("API_ID must be a number")
 
 
 # =========================================================
@@ -115,19 +107,14 @@ init_db()
 # SESSION DIRECTORY
 # =========================================================
 
-os.makedirs(
-    "sessions",
-    exist_ok=True
-)
+os.makedirs("sessions", exist_ok=True)
 
 
 # =========================================================
-# BOT
+# TELEGRAM BOT
 # =========================================================
 
-bot = Bot(
-    token=BOT_TOKEN
-)
+bot = Bot(BOT_TOKEN)
 
 dp = Dispatcher()
 
@@ -137,7 +124,7 @@ dp.include_router(router)
 
 
 # =========================================================
-# TELETHON CLIENTS
+# CLIENT STORAGE
 # =========================================================
 
 clients = {}
@@ -167,7 +154,7 @@ def get_client(user_id):
 
 
 # =========================================================
-# STATES
+# FSM
 # =========================================================
 
 class ChannelState(StatesGroup):
@@ -176,40 +163,7 @@ class ChannelState(StatesGroup):
 
 
 # =========================================================
-# REPLY KEYBOARD
-# =========================================================
-
-def main_keyboard():
-
-    return ReplyKeyboardMarkup(
-        keyboard=[
-
-            [
-                KeyboardButton(
-                    text="🔐 Connect Telegram"
-                ),
-                KeyboardButton(
-                    text="➕ Add Channel"
-                )
-            ],
-
-            [
-                KeyboardButton(
-                    text="📺 My Channels"
-                ),
-                KeyboardButton(
-                    text="ℹ️ Help"
-                )
-            ]
-
-        ],
-        resize_keyboard=True,
-        is_persistent=True
-    )
-
-
-# =========================================================
-# INLINE MAIN MENU
+# MAIN MENU
 # =========================================================
 
 def main_menu():
@@ -258,60 +212,12 @@ async def start_handler(message: Message):
 
     await message.answer(
         "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\n"
-        "Channel Live-এ কোনো member join করলে "
-        "তার speaking permission দেওয়ার চেষ্টা করবে "
-        "এই system।\n\n"
-        "প্রথমে নিচের:\n"
-        "🔐 <b>Connect Telegram</b>\n"
-        "চাপুন।",
+        "Channel member Live-এ join করলে "
+        "automatically speaking permission দেওয়ার "
+        "জন্য এই bot ব্যবহার করতে পারবেন।\n\n"
+        "প্রথমে Telegram account connect করুন।",
         parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
-
-
-# =========================================================
-# REPLY KEYBOARD HANDLERS
-# =========================================================
-
-@router.message(F.text == "🔐 Connect Telegram")
-async def connect_button_handler(message: Message):
-
-    await start_telegram_connection(
-        message.from_user.id,
-        message
-    )
-
-
-@router.message(F.text == "➕ Add Channel")
-async def add_channel_button_handler(
-    message: Message,
-    state: FSMContext
-):
-
-    await start_add_channel(
-        message.from_user.id,
-        message,
-        state
-    )
-
-
-@router.message(F.text == "📺 My Channels")
-async def my_channels_button_handler(
-    message: Message
-):
-
-    await show_my_channels_message(
-        message
-    )
-
-
-@router.message(F.text == "ℹ️ Help")
-async def help_button_handler(
-    message: Message
-):
-
-    await send_help_message(
-        message
+        reply_markup=main_menu()
     )
 
 
@@ -319,46 +225,41 @@ async def help_button_handler(
 # HELP
 # =========================================================
 
-async def send_help_message(message: Message):
-
-    await message.answer(
-        "ℹ️ <b>কিভাবে কাজ করবে</b>\n\n"
-        "1️⃣ 🔐 Connect Telegram চাপুন\n"
-        "2️⃣ QR Code Scan করুন\n"
-        "3️⃣ ➕ Add Channel চাপুন\n"
-        "4️⃣ নিজের Channel username দিন\n"
-        "5️⃣ Channel-এ Live চালু করুন\n"
-        "6️⃣ কোনো Channel member Live-এ join করলে\n"
-        "7️⃣ Bot তাকে শনাক্ত করবে\n"
-        "8️⃣ Muted থাকলে speaking permission দেওয়ার "
-        "চেষ্টা করবে\n\n"
-        "⚠️ Bot শুধু Live-এ join করা participant-দের "
-        "নিয়ে কাজ করবে।\n\n"
-        "⚠️ Channel-এর উপর প্রয়োজনীয় admin permission "
-        "থাকতে হবে।",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
-
-
 @router.callback_query(F.data == "help")
-async def help_callback(call: CallbackQuery):
+async def help_handler(call: CallbackQuery):
 
     await call.answer()
 
-    await send_help_message(
-        call.message
+    await call.message.edit_text(
+
+        "ℹ️ <b>কিভাবে কাজ করবে</b>\n\n"
+
+        "1️⃣ Telegram account connect করুন\n"
+        "2️⃣ নিজের Channel add করুন\n"
+        "3️⃣ Live শুরু করুন\n"
+        "4️⃣ Channel member Live-এ join করবে\n"
+        "5️⃣ Bot member যাচাই করবে\n"
+        "6️⃣ Member হলে Auto Allow করার চেষ্টা করবে\n"
+        "7️⃣ Member নিজের Mic ON করতে পারবে\n\n"
+
+        "⚠️ এটি Telegram Live / Group Call-এর "
+        "participant permission ব্যবস্থার উপর নির্ভর করে।",
+
+        parse_mode="HTML",
+        reply_markup=main_menu()
     )
 
 
 # =========================================================
-# TELEGRAM CONNECT
+# CONNECT TELEGRAM
 # =========================================================
 
-async def start_telegram_connection(
-    user_id,
-    message
-):
+@router.callback_query(F.data == "connect")
+async def connect_telegram(call: CallbackQuery):
+
+    await call.answer()
+
+    user_id = call.from_user.id
 
     client = get_client(user_id)
 
@@ -366,13 +267,21 @@ async def start_telegram_connection(
 
         await client.connect()
 
+        # ---------------------------------------------
         # Already connected
+        # ---------------------------------------------
+
         if await client.is_user_authorized():
 
             db.execute(
                 """
                 INSERT OR REPLACE INTO users
-                (user_id, session_name, connected, created_at)
+                (
+                    user_id,
+                    session_name,
+                    connected,
+                    created_at
+                )
                 VALUES (?, ?, 1, ?)
                 """,
                 (
@@ -384,25 +293,29 @@ async def start_telegram_connection(
 
             db.commit()
 
-            await message.answer(
+            await call.message.answer(
                 "✅ <b>Telegram Already Connected</b>\n\n"
-                "আপনার Telegram account আগে থেকেই connected আছে।\n\n"
-                "এখন ➕ Add Channel চাপুন।",
+                "আপনার Telegram account আগে থেকেই connected আছে।",
                 parse_mode="HTML",
-                reply_markup=main_keyboard()
+                reply_markup=main_menu()
             )
 
             return
 
-        # Create QR login
+
+        # ---------------------------------------------
+        # Create QR Login
+        # ---------------------------------------------
+
         login = await client.qr_login()
 
         login_tasks[user_id] = login
 
-        # Generate QR image
-        qr_image = qrcode.make(
-            login.url
-        )
+        # ---------------------------------------------
+        # Generate QR
+        # ---------------------------------------------
+
+        qr_image = qrcode.make(login.url)
 
         buffer = io.BytesIO()
 
@@ -418,85 +331,159 @@ async def start_telegram_connection(
             filename="telegram_login_qr.png"
         )
 
+
+        # ---------------------------------------------
+        # IMPORTANT:
+        # Make tg://login link a clickable button
+        # ---------------------------------------------
+
+        login_keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+
+                [
+                    InlineKeyboardButton(
+                        text="📱 Open Telegram & Connect",
+                        url=login.url
+                    )
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        text="🔄 Generate New QR",
+                        callback_data="connect"
+                    )
+                ],
+
+                [
+                    InlineKeyboardButton(
+                        text="❌ Cancel",
+                        callback_data="cancel_login"
+                    )
+                ]
+
+            ]
+        )
+
+
+        # ---------------------------------------------
         # Send QR
-        await message.answer_photo(
+        # ---------------------------------------------
+
+        await call.message.answer_photo(
+
             photo=photo,
+
             caption=(
                 "🔐 <b>Connect Telegram</b>\n\n"
-                "📱 Telegram App খুলুন\n\n"
-                "➡️ Settings\n"
-                "➡️ Devices\n"
-                "➡️ Link Desktop Device\n\n"
-                "📷 তারপর উপরের QR Code Scan করুন।\n\n"
-                "🔗 <b>QR Scan না হলে Login Link:</b>\n\n"
-                f"<code>{login.url}</code>\n\n"
-                "⚠️ OTP বা 2FA password এই bot-এ পাঠাবেন না।"
+
+                "নিচের QR Code Telegram App দিয়ে "
+                "Scan করতে পারেন।\n\n"
+
+                "অথবা নিচের "
+                "<b>📱 Open Telegram & Connect</b> "
+                "বাটনে চাপুন।\n\n"
+
+                "📱 <b>QR পদ্ধতি:</b>\n"
+                "Telegram → Settings → Devices → "
+                "Link Desktop Device → QR Scan\n\n"
+
+                "⚠️ OTP বা 2FA password এই bot-এ "
+                "পাঠাবেন না।"
             ),
-            parse_mode="HTML"
+
+            parse_mode="HTML",
+
+            reply_markup=login_keyboard
         )
 
-        await message.answer(
-            "⏳ QR Scan করার অপেক্ষায় আছি...\n\n"
-            "QR Scan সফল হলে automatically connected হয়ে যাবে।"
-        )
 
-        asyncio.create_task(
-            wait_for_qr_login(
-                user_id
+        # ---------------------------------------------
+        # Send clickable link separately as backup
+        # ---------------------------------------------
+
+        await call.message.answer(
+
+            "🔗 <b>Login Link</b>\n\n"
+            "উপরের বাটন কাজ না করলে নিচের বাটনে চাপুন।",
+
+            parse_mode="HTML",
+
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+
+                    [
+                        InlineKeyboardButton(
+                            text="🔗 Open Telegram Login",
+                            url=login.url
+                        )
+                    ]
+
+                ]
             )
         )
 
+
+        # ---------------------------------------------
+        # Start waiting
+        # ---------------------------------------------
+
+        asyncio.create_task(
+            wait_for_qr_login(user_id)
+        )
+
+
     except Exception as e:
 
-        logger.exception(
-            "Telegram connect error"
-        )
+        logger.exception(e)
 
-        await message.answer(
+        await call.message.answer(
             "❌ <b>Telegram connect করা যায়নি</b>\n\n"
             f"<code>{str(e)}</code>",
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
+            parse_mode="HTML"
         )
 
 
 # =========================================================
-# INLINE CONNECT BUTTON
+# CANCEL LOGIN
 # =========================================================
 
-@router.callback_query(F.data == "connect")
-async def connect_callback(
-    call: CallbackQuery
-):
+@router.callback_query(F.data == "cancel_login")
+async def cancel_login(call: CallbackQuery):
 
     await call.answer()
 
-    await start_telegram_connection(
-        call.from_user.id,
-        call.message
+    user_id = call.from_user.id
+
+    login_tasks.pop(
+        user_id,
+        None
+    )
+
+    await call.message.answer(
+        "❌ Login process cancelled.",
+        reply_markup=main_menu()
     )
 
 
 # =========================================================
-# WAIT QR LOGIN
+# WAIT FOR QR LOGIN
 # =========================================================
 
-async def wait_for_qr_login(
-    user_id
-):
+async def wait_for_qr_login(user_id):
 
     try:
 
-        login = login_tasks.get(
-            user_id
-        )
+        login = login_tasks.get(user_id)
 
         if not login:
             return
 
-        client = get_client(
-            user_id
-        )
+        client = get_client(user_id)
+
+
+        # ---------------------------------------------
+        # Wait for QR / login
+        # ---------------------------------------------
 
         try:
 
@@ -508,65 +495,89 @@ async def wait_for_qr_login(
 
             await bot.send_message(
                 user_id,
-                "⚠️ <b>2-Step Verification চালু আছে</b>\n\n"
-                "QR login-এর পরে Telegram আপনার 2FA "
-                "password চাইতে পারে।\n\n"
-                "Password এই bot-এ পাঠাবেন না।",
-                parse_mode="HTML"
+
+                "⚠️ আপনার Telegram account-এ "
+                "2-Step Verification চালু আছে।\n\n"
+
+                "এই bot আপনার 2FA password "
+                "সংগ্রহ করবে না।"
             )
 
             return
 
+
+        # ---------------------------------------------
+        # Save connection
+        # ---------------------------------------------
+
         db.execute(
             """
             INSERT OR REPLACE INTO users
-            (user_id, session_name, connected, created_at)
+            (
+                user_id,
+                session_name,
+                connected,
+                created_at
+            )
             VALUES (?, ?, 1, ?)
             """,
             (
                 user_id,
                 session_path(user_id),
-                1,
                 int(time.time())
             )
         )
 
         db.commit()
 
+
+        # ---------------------------------------------
+        # Success
+        # ---------------------------------------------
+
         await bot.send_message(
+
             user_id,
+
             "✅ <b>Telegram Connected Successfully!</b>\n\n"
-            "এখন ➕ Add Channel চাপুন।",
+            "এখন আপনি আপনার Channel Add করতে পারবেন।",
+
             parse_mode="HTML",
-            reply_markup=main_keyboard()
+
+            reply_markup=main_menu()
         )
+
 
     except asyncio.TimeoutError:
 
         await bot.send_message(
             user_id,
-            "⌛ QR Code-এর সময় শেষ হয়ে গেছে।\n\n"
+            "⏳ QR Login-এর সময় শেষ হয়ে গেছে।\n\n"
             "আবার 🔐 Connect Telegram চাপুন।",
-            reply_markup=main_keyboard()
+            reply_markup=main_menu()
         )
+
 
     except Exception as e:
 
-        logger.exception(
-            "QR login error"
-        )
+        logger.exception(e)
 
         try:
 
             await bot.send_message(
                 user_id,
-                "❌ <b>Telegram Login Failed</b>\n\n"
+
+                "❌ <b>Login failed</b>\n\n"
                 f"<code>{str(e)}</code>",
-                parse_mode="HTML"
+
+                parse_mode="HTML",
+
+                reply_markup=main_menu()
             )
 
         except Exception:
             pass
+
 
     finally:
 
@@ -580,11 +591,13 @@ async def wait_for_qr_login(
 # ADD CHANNEL
 # =========================================================
 
-async def start_add_channel(
-    user_id,
-    message,
-    state
+@router.callback_query(F.data == "add_channel")
+async def add_channel_start(
+    call: CallbackQuery,
+    state: FSMContext
 ):
+
+    await call.answer()
 
     row = db.execute(
         """
@@ -592,49 +605,34 @@ async def start_add_channel(
         FROM users
         WHERE user_id=?
         """,
-        (user_id,)
+        (call.from_user.id,)
     ).fetchone()
+
 
     if not row or not row["connected"]:
 
-        await message.answer(
-            "❌ আগে 🔐 Connect Telegram করুন।",
-            reply_markup=main_keyboard()
+        await call.message.answer(
+            "❌ আগে 🔐 Connect Telegram করুন।"
         )
 
         return
+
 
     await state.set_state(
         ChannelState.waiting_channel
     )
 
-    await message.answer(
+
+    await call.message.answer(
+
         "➕ <b>Add Channel</b>\n\n"
+
         "আপনার Channel username পাঠান।\n\n"
+
         "উদাহরণ:\n"
-        "<code>@MyChannel</code>\n\n"
-        "অথবা:\n"
-        "<code>MyChannel</code>",
+        "<code>@MyChannel</code>",
+
         parse_mode="HTML"
-    )
-
-
-# =========================================================
-# INLINE ADD CHANNEL
-# =========================================================
-
-@router.callback_query(F.data == "add_channel")
-async def add_channel_callback(
-    call: CallbackQuery,
-    state: FSMContext
-):
-
-    await call.answer()
-
-    await start_add_channel(
-        call.from_user.id,
-        call.message,
-        state
     )
 
 
@@ -657,36 +655,40 @@ async def save_channel(
 
         return
 
+
     username = message.text.strip()
+
 
     if not username.startswith("@"):
 
         username = "@" + username
 
+
     user_id = message.from_user.id
 
-    client = get_client(
-        user_id
-    )
+    client = get_client(user_id)
+
 
     try:
 
         await client.connect()
 
+
         if not await client.is_user_authorized():
 
             await message.answer(
-                "❌ Telegram account connected নেই।\n\n"
-                "আগে 🔐 Connect Telegram করুন।"
+                "❌ Telegram account connected নেই।"
             )
 
             await state.clear()
 
             return
 
+
         entity = await client.get_entity(
             username
         )
+
 
         title = getattr(
             entity,
@@ -694,11 +696,13 @@ async def save_channel(
             username
         )
 
+
         await client(
             functions.channels.GetFullChannelRequest(
                 channel=entity
             )
         )
+
 
         db.execute(
             """
@@ -719,32 +723,34 @@ async def save_channel(
                 username,
                 entity.id,
                 title,
-                1,
-                1,
                 int(time.time())
             )
         )
 
         db.commit()
 
+
         await state.clear()
 
+
         await message.answer(
+
             f"✅ <b>Channel Added</b>\n\n"
+
             f"📺 {title}\n"
             f"🔗 {username}\n\n"
-            "🎤 Auto Allow: <b>ON</b>\n\n"
-            "এখন Channel-এ Live চালু করলে "
-            "monitoring শুরু হবে।",
+
+            "🎤 Auto Allow: <b>ON</b>",
+
             parse_mode="HTML",
-            reply_markup=main_keyboard()
+
+            reply_markup=main_menu()
         )
+
 
     except Exception as e:
 
-        logger.exception(
-            "Channel add error"
-        )
+        logger.exception(e)
 
         await message.answer(
             "❌ <b>Channel add করা যায়নি</b>\n\n"
@@ -759,88 +765,90 @@ async def save_channel(
 # MY CHANNELS
 # =========================================================
 
-async def show_my_channels_message(
-    message: Message
-):
+@router.callback_query(F.data == "my_channels")
+async def my_channels(call: CallbackQuery):
+
+    await call.answer()
+
 
     rows = db.execute(
         """
-        SELECT id, title, channel_username, auto_allow
+        SELECT id, title, auto_allow
         FROM channels
         WHERE owner_id=? AND active=1
-        ORDER BY id DESC
         """,
-        (
-            message.from_user.id,
-        )
+        (call.from_user.id,)
     ).fetchall()
 
-    if not rows:
 
-        await message.answer(
-            "📺 <b>My Channels</b>\n\n"
-            "কোনো Channel নেই।\n\n"
-            "➕ Add Channel চাপুন।",
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
-        )
+    buttons = []
 
-        return
-
-    text = "📺 <b>My Channels</b>\n\n"
 
     for row in rows:
 
         status = (
-            "🟢 ON"
+            "🟢"
             if row["auto_allow"]
             else
-            "🔴 OFF"
+            "🔴"
         )
 
-        text += (
-            f"📺 <b>{row['title']}</b>\n"
-            f"🔗 {row['channel_username']}\n"
-            f"🎤 Auto Allow: {status}\n\n"
+
+        buttons.append([
+
+            InlineKeyboardButton(
+                text=f"{status} {row['title']}",
+                callback_data=f"channel:{row['id']}"
+            )
+
+        ])
+
+
+    buttons.append([
+
+        InlineKeyboardButton(
+            text="➕ Add Channel",
+            callback_data="add_channel"
         )
 
-    await message.answer(
+    ])
+
+
+    buttons.append([
+
+        InlineKeyboardButton(
+            text="⬅️ Back",
+            callback_data="back"
+        )
+
+    ])
+
+
+    if rows:
+
+        text = (
+            "📺 <b>My Channels</b>\n\n"
+            "🟢 Auto Allow ON\n"
+            "🔴 Auto Allow OFF"
+        )
+
+    else:
+
+        text = (
+            "📺 <b>My Channels</b>\n\n"
+            "কোনো Channel নেই।"
+        )
+
+
+    await call.message.edit_text(
+
         text,
+
         parse_mode="HTML",
+
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=f"⚙️ {row['title']}",
-                        callback_data=f"channel:{row['id']}"
-                    )
-                ]
-                for row in rows
-            ] + [
-                [
-                    InlineKeyboardButton(
-                        text="➕ Add Channel",
-                        callback_data="add_channel"
-                    )
-                ]
-            ]
+            inline_keyboard=buttons
         )
-    )
-
-
-# =========================================================
-# INLINE MY CHANNELS
-# =========================================================
-
-@router.callback_query(F.data == "my_channels")
-async def my_channels_callback(
-    call: CallbackQuery
-):
-
-    await call.answer()
-
-    await show_my_channels_message(
-        call.message
     )
 
 
@@ -848,24 +856,16 @@ async def my_channels_callback(
 # CHANNEL MENU
 # =========================================================
 
-@router.callback_query(
-    F.data.startswith("channel:")
-)
-async def channel_menu(
-    call: CallbackQuery
-):
+@router.callback_query(F.data.startswith("channel:"))
+async def channel_menu(call: CallbackQuery):
 
     await call.answer()
 
-    try:
 
-        channel_id = int(
-            call.data.split(":")[1]
-        )
+    channel_id = int(
+        call.data.split(":")[1]
+    )
 
-    except:
-
-        return
 
     row = db.execute(
         """
@@ -879,13 +879,10 @@ async def channel_menu(
         )
     ).fetchone()
 
+
     if not row:
-
-        await call.message.answer(
-            "❌ Channel পাওয়া যায়নি।"
-        )
-
         return
+
 
     status = (
         "🟢 ON"
@@ -894,66 +891,80 @@ async def channel_menu(
         "🔴 OFF"
     )
 
+
     await call.message.edit_text(
+
         f"📺 <b>{row['title']}</b>\n\n"
-        f"🔗 {row['channel_username']}\n"
+
         f"🎤 Auto Allow: <b>{status}</b>\n\n"
-        "Auto Allow ON থাকলে Live participant-এর "
-        "মধ্যে Channel member পাওয়া গেলে muted "
-        "থাকলে speaking permission দেওয়ার চেষ্টা করবে।",
+
+        "Auto Allow ON থাকলে bot "
+        "Channel member-দের Live participant "
+        "হিসেবে পেলে speaking permission দেওয়ার "
+        "চেষ্টা করবে।",
+
         parse_mode="HTML",
+
         reply_markup=InlineKeyboardMarkup(
+
             inline_keyboard=[
 
                 [
+
                     InlineKeyboardButton(
                         text="🎤 Toggle Auto Allow",
                         callback_data=f"toggle:{row['id']}"
                     )
+
                 ],
 
                 [
+
                     InlineKeyboardButton(
                         text="📊 Live Status",
                         callback_data=f"statuslive:{row['id']}"
                     )
+
                 ],
 
                 [
+
                     InlineKeyboardButton(
                         text="❌ Remove Channel",
                         callback_data=f"remove:{row['id']}"
                     )
+
                 ],
 
                 [
+
                     InlineKeyboardButton(
                         text="⬅️ Back",
                         callback_data="my_channels"
                     )
+
                 ]
 
             ]
+
         )
     )
 
 
 # =========================================================
-# TOGGLE
+# TOGGLE AUTO ALLOW
 # =========================================================
 
-@router.callback_query(
-    F.data.startswith("toggle:")
-)
-async def toggle_auto_allow(
-    call: CallbackQuery
-):
+@router.callback_query(F.data.startswith("toggle:"))
+async def toggle_auto_allow(call: CallbackQuery):
 
     await call.answer()
+
 
     channel_id = int(
         call.data.split(":")[1]
     )
+
 
     row = db.execute(
         """
@@ -967,8 +978,10 @@ async def toggle_auto_allow(
         )
     ).fetchone()
 
+
     if not row:
         return
+
 
     new_value = (
         0
@@ -976,6 +989,7 @@ async def toggle_auto_allow(
         else
         1
     )
+
 
     db.execute(
         """
@@ -992,27 +1006,24 @@ async def toggle_auto_allow(
 
     db.commit()
 
-    await channel_menu(
-        call
-    )
+
+    await channel_menu(call)
 
 
 # =========================================================
 # REMOVE CHANNEL
 # =========================================================
 
-@router.callback_query(
-    F.data.startswith("remove:")
-)
-async def remove_channel(
-    call: CallbackQuery
-):
+@router.callback_query(F.data.startswith("remove:"))
+async def remove_channel(call: CallbackQuery):
 
     await call.answer()
+
 
     channel_id = int(
         call.data.split(":")[1]
     )
+
 
     db.execute(
         """
@@ -1028,19 +1039,17 @@ async def remove_channel(
 
     db.commit()
 
-    await call.message.edit_text(
-        "✅ <b>Channel Removed</b>",
-        parse_mode="HTML"
-    )
 
-    await call.message.answer(
-        "Main Menu:",
-        reply_markup=main_keyboard()
+    await call.message.edit_text(
+
+        "✅ Channel removed.",
+
+        reply_markup=main_menu()
     )
 
 
 # =========================================================
-# GET ACTIVE GROUP CALL
+# GET ACTIVE CALL
 # =========================================================
 
 async def get_active_call(
@@ -1052,11 +1061,13 @@ async def get_active_call(
         channel_username
     )
 
+
     full = await client(
         functions.channels.GetFullChannelRequest(
             channel=entity
         )
     )
+
 
     call = getattr(
         full.full_chat,
@@ -1064,11 +1075,12 @@ async def get_active_call(
         None
     )
 
+
     return call, entity
 
 
 # =========================================================
-# GET LIVE PARTICIPANTS
+# GET PARTICIPANTS
 # =========================================================
 
 async def get_participants(
@@ -1081,6 +1093,7 @@ async def get_participants(
         access_hash=call.access_hash
     )
 
+
     result = await client(
         functions.phone.GetGroupCallRequest(
             call=input_call,
@@ -1088,10 +1101,15 @@ async def get_participants(
         )
     )
 
+
     users = {
+
         user.id: user
+
         for user in result.users
+
     }
+
 
     return result.participants, users
 
@@ -1108,36 +1126,41 @@ async def is_channel_member(
 
     try:
 
-        if not getattr(
-            user,
-            "access_hash",
-            None
-        ):
-            return False
-
         result = await client(
+
             functions.channels.GetParticipantRequest(
+
                 channel=channel_entity,
+
                 participant=types.InputPeerUser(
                     user_id=user.id,
                     access_hash=user.access_hash
                 )
+
             )
+
         )
+
 
         participant = result.participant
 
+
         if isinstance(
+
             participant,
+
             (
                 types.ChannelParticipantLeft,
                 types.ChannelParticipantBanned
             )
+
         ):
 
             return False
 
+
         return True
+
 
     except Exception:
 
@@ -1145,7 +1168,7 @@ async def is_channel_member(
 
 
 # =========================================================
-# ALLOW SPEAKING
+# ALLOW PARTICIPANT
 # =========================================================
 
 async def allow_participant(
@@ -1159,68 +1182,82 @@ async def allow_participant(
         access_hash=call.access_hash
     )
 
-    participant = types.InputPeerUser(
-        user_id=user.id,
-        access_hash=user.access_hash
+
+    participant = await client.get_input_entity(
+        user
     )
+
 
     await client(
+
         functions.phone.EditGroupCallParticipantRequest(
+
             call=input_call,
+
             participant=participant,
+
             muted=False
+
         )
+
     )
 
 
 # =========================================================
-# MONITOR ONE CHANNEL
+# MONITOR CHANNEL
 # =========================================================
 
-async def monitor_channel(
-    row
-):
+async def monitor_channel(row):
 
     owner_id = row["owner_id"]
+
 
     client = get_client(
         owner_id
     )
 
+
     if not client.is_connected():
 
         await client.connect()
+
 
     if not await client.is_user_authorized():
 
         return
 
+
     try:
 
         call, channel_entity = \
             await get_active_call(
+
                 client,
+
                 row["channel_username"]
+
             )
 
-        # No Live
+
         if not call:
 
             return
 
+
         participants, users = \
             await get_participants(
+
                 client,
+
                 call
+
             )
+
 
         for participant in participants:
 
-            peer = getattr(
-                participant,
-                "peer",
-                None
-            )
+            peer = participant.peer
+
 
             if not isinstance(
                 peer,
@@ -1229,70 +1266,91 @@ async def monitor_channel(
 
                 continue
 
+
             user = users.get(
                 peer.user_id
             )
+
 
             if not user:
 
                 continue
 
-            # Check if participant is channel member
+
             is_member = await is_channel_member(
+
                 client,
+
                 channel_entity,
+
                 user
+
             )
+
 
             if not is_member:
 
                 continue
 
-            # Check mute status
+
             muted = getattr(
+
                 participant,
+
                 "muted",
+
                 False
+
             )
+
 
             if muted:
 
                 try:
 
                     await allow_participant(
+
                         client,
+
                         call,
+
                         user
+
                     )
 
+
                     logger.info(
+
                         "Auto allowed user %s in %s",
+
                         user.id,
+
                         row["channel_username"]
+
                     )
+
 
                 except Exception as e:
 
                     logger.warning(
-                        "Allow failed for %s: %s",
-                        user.id,
+
+                        "Allow failed: %s",
+
                         e
+
                     )
 
-    except RPCError as e:
-
-        logger.warning(
-            "Telegram RPC error for %s: %s",
-            row["channel_username"],
-            e
-        )
 
     except Exception as e:
 
         logger.warning(
+
             "Monitor error for %s: %s",
+
             row["channel_username"],
+
             e
+
         )
 
 
@@ -1306,43 +1364,39 @@ async def auto_monitor():
         "Auto Speaker Monitor started"
     )
 
+
     while True:
 
         try:
 
             rows = db.execute(
+
                 """
                 SELECT *
                 FROM channels
                 WHERE active=1
                 AND auto_allow=1
                 """
+
             ).fetchall()
+
 
             for row in rows:
 
-                try:
+                await monitor_channel(
+                    row
+                )
 
-                    await monitor_channel(
-                        row
-                    )
-
-                except Exception as e:
-
-                    logger.warning(
-                        "Channel monitor failed: %s",
-                        e
-                    )
 
                 await asyncio.sleep(
                     0.5
                 )
 
+
         except Exception as e:
 
-            logger.exception(
-                "Monitor loop error"
-            )
+            logger.exception(e)
+
 
         await asyncio.sleep(
             3
@@ -1353,85 +1407,108 @@ async def auto_monitor():
 # LIVE STATUS
 # =========================================================
 
-@router.callback_query(
-    F.data.startswith("statuslive:")
-)
-async def live_status(
-    call: CallbackQuery
-):
+@router.callback_query(F.data.startswith("statuslive:"))
+async def live_status(call: CallbackQuery):
 
     await call.answer()
+
 
     channel_id = int(
         call.data.split(":")[1]
     )
 
+
     row = db.execute(
+
         """
         SELECT *
         FROM channels
         WHERE id=? AND owner_id=?
         """,
+
         (
             channel_id,
             call.from_user.id
         )
+
     ).fetchone()
 
-    if not row:
 
+    if not row:
         return
+
 
     client = get_client(
         call.from_user.id
     )
 
+
     try:
 
         await client.connect()
 
+
         active_call, channel_entity = \
             await get_active_call(
+
                 client,
+
                 row["channel_username"]
+
             )
+
 
         if not active_call:
 
             await call.message.edit_text(
-                "🔴 <b>এখন কোনো Active Live নেই।</b>",
-                parse_mode="HTML",
+
+                "🔴 এখন কোনো Active Live নেই.",
+
                 reply_markup=InlineKeyboardMarkup(
+
                     inline_keyboard=[
+
                         [
+
                             InlineKeyboardButton(
+
                                 text="⬅️ Back",
-                                callback_data=f"channel:{channel_id}"
+
+                                callback_data=
+                                f"channel:{channel_id}"
+
                             )
+
                         ]
+
                     ]
+
                 )
+
             )
 
             return
 
+
         participants, users = \
             await get_participants(
+
                 client,
+
                 active_call
+
             )
+
 
         members = 0
         allowed = 0
         muted = 0
 
+
         for participant in participants:
 
-            peer = getattr(
-                participant,
-                "peer",
-                None
-            )
+            peer = participant.peer
+
 
             if not isinstance(
                 peer,
@@ -1440,26 +1517,38 @@ async def live_status(
 
                 continue
 
+
             user = users.get(
                 peer.user_id
             )
+
 
             if not user:
 
                 continue
 
+
             if await is_channel_member(
+
                 client,
+
                 channel_entity,
+
                 user
+
             ):
 
                 members += 1
 
+
                 if getattr(
+
                     participant,
+
                     "muted",
+
                     False
+
                 ):
 
                     muted += 1
@@ -1468,42 +1557,66 @@ async def live_status(
 
                     allowed += 1
 
+
         await call.message.edit_text(
+
             "🎙 <b>LIVE STATUS</b>\n\n"
+
             f"📺 {row['title']}\n\n"
+
             f"👥 Channel Members: {members}\n"
             f"🔇 Muted: {muted}\n"
             f"🎤 Allowed: {allowed}\n\n"
+
             f"Auto Allow: "
             f"{'🟢 ON' if row['auto_allow'] else '🔴 OFF'}",
+
             parse_mode="HTML",
+
             reply_markup=InlineKeyboardMarkup(
+
                 inline_keyboard=[
 
                     [
+
                         InlineKeyboardButton(
+
                             text="🔄 Refresh",
-                            callback_data=f"statuslive:{channel_id}"
+
+                            callback_data=
+                            f"statuslive:{channel_id}"
+
                         )
+
                     ],
 
                     [
+
                         InlineKeyboardButton(
+
                             text="⬅️ Back",
-                            callback_data=f"channel:{channel_id}"
+
+                            callback_data=
+                            f"channel:{channel_id}"
+
                         )
+
                     ]
 
                 ]
+
             )
+
         )
+
 
     except Exception as e:
 
         await call.message.answer(
-            "❌ <b>Status Error</b>\n\n"
-            f"<code>{str(e)}</code>",
-            parse_mode="HTML"
+
+            "❌ Status error:\n"
+            f"{e}"
+
         )
 
 
@@ -1511,76 +1624,21 @@ async def live_status(
 # BACK
 # =========================================================
 
-@router.callback_query(
-    F.data == "back"
-)
-async def back_handler(
-    call: CallbackQuery
-):
+@router.callback_query(F.data == "back")
+async def back_handler(call: CallbackQuery):
 
     await call.answer()
 
-    await call.message.answer(
+
+    await call.message.edit_text(
+
         "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\n"
         "Main Menu:",
+
         parse_mode="HTML",
-        reply_markup=main_keyboard()
+
+        reply_markup=main_menu()
     )
-
-
-# =========================================================
-# HEALTH SERVER FOR RENDER / UPTIMEROBOT
-# =========================================================
-
-async def health_handler(request):
-
-    return web.Response(
-        text="Telegram Auto Speaker is running ✅",
-        status=200
-    )
-
-
-async def start_health_server():
-
-    app = web.Application()
-
-    app.router.add_get(
-        "/",
-        health_handler
-    )
-
-    app.router.add_get(
-        "/health",
-        health_handler
-    )
-
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000"
-        )
-    )
-
-    runner = web.AppRunner(
-        app
-    )
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        port
-    )
-
-    await site.start()
-
-    logger.info(
-        "Health server running on port %s",
-        port
-    )
-
-    return runner
 
 
 # =========================================================
@@ -1590,37 +1648,20 @@ async def start_health_server():
 async def main():
 
     logger.info(
-        "Telegram Auto Speaker starting..."
+        "Telegram Auto Speaker started"
     )
 
-    # Start Render health server
-    await start_health_server()
 
-    # Start monitor
     asyncio.create_task(
         auto_monitor()
     )
 
-    # Start Telegram bot
+
     await dp.start_polling(
         bot
     )
 
 
-# =========================================================
-# RUN
-# =========================================================
-
 if __name__ == "__main__":
 
-    try:
-
-        asyncio.run(
-            main()
-        )
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "Bot stopped."
-        )
+    asyncio.run(main())
