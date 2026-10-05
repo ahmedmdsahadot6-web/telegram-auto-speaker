@@ -122,7 +122,9 @@ def get_client(user_id):
         clients[user_id] = TelegramClient(
             session_path(user_id),
             API_ID,
-            API_HASH
+            API_HASH,
+            connection_retries=5,
+            timeout=30
         )
     return clients[user_id]
 
@@ -232,9 +234,9 @@ async def connect_telegram_menu(message: Message, state: FSMContext):
     client = get_client(user_id)  
 
     try:  
-        if client.is_connected():
-            await client.disconnect()
-        await client.connect()  
+        if not client.is_connected():
+            await client.connect()
+            
         if await client.is_user_authorized():  
             db.execute(  
                 """  
@@ -334,8 +336,6 @@ async def wait_for_qr_login(user_id):
         login = login_tasks.get(user_id)  
         if not login:  
             return  
-
-        client = get_client(user_id)  
 
         try:  
             await login.wait(timeout=180)  
@@ -529,7 +529,8 @@ async def check_connection(call: CallbackQuery):
     client = get_client(user_id)  
 
     try:  
-        await client.connect()  
+        if not client.is_connected():
+            await client.connect()  
         if await client.is_user_authorized():  
             db.execute(  
                 """  
@@ -670,7 +671,9 @@ async def save_channel(message, state, channel_type):
     client = get_client(user_id)  
 
     try:  
-        await client.connect()  
+        if not client.is_connected():
+            await client.connect()
+            
         if not await client.is_user_authorized():  
             await message.answer("❌ Telegram account connected নেই।")  
             await state.clear()  
@@ -785,13 +788,13 @@ async def monitor_user(user_id):
 
     client = get_client(user_id)  
 
-    if not client.is_connected():  
-        await client.connect()  
-
-    if not await client.is_user_authorized():  
-        return  
-
     try:  
+        if not client.is_connected():  
+            await client.connect()  
+
+        if not await client.is_user_authorized():  
+            return  
+
         call, live_entity = await get_active_call(client, live_row["channel_username"])  
         if not call:  
             return  
@@ -882,7 +885,9 @@ async def live_status_message(message):
     client = get_client(user_id)  
 
     try:  
-        await client.connect()  
+        if not client.is_connected():
+            await client.connect()  
+            
         call, live_entity = await get_active_call(client, live_row["channel_username"])  
 
         if not call:  
