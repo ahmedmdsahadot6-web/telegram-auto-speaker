@@ -28,7 +28,8 @@ from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
-    PasswordHashInvalidError
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError
 )
 
 import qrcode
@@ -199,9 +200,7 @@ async def send_help(message):
         "চেষ্টা করবে।\n\n"  
         "⚠️ Live Stream Channel-এ connected "  
         "Telegram account-এর প্রয়োজনীয় "  
-        "admin/manage-call permission থাকতে হবে।\n\n"  
-        "⚠️ RTMP livestream হলে Telegram API "  
-        "দিয়ে participant unmute করা যায় না।",  
+        "admin/manage-call permission থাকতে হবে।",  
         parse_mode="HTML",  
         reply_markup=main_keyboard()  
     )
@@ -233,6 +232,8 @@ async def connect_telegram_menu(message: Message, state: FSMContext):
     client = get_client(user_id)  
 
     try:  
+        if client.is_connected():
+            await client.disconnect()
         await client.connect()  
         if await client.is_user_authorized():  
             db.execute(  
@@ -307,7 +308,7 @@ async def connect_qr_callback(call: CallbackQuery, state: FSMContext):
             caption=(  
                 "🔐 <b>Connect via QR Code</b>\n\n"  
                 "পদ্ধতি ১:\n"  
-                "নিচের <b>Connect via Telegram</b> button চাপুন。\n\n"  
+                "নিচের <b>Connect via Telegram</b> button চাপুন।\n\n"  
                 "অথবা\n\n"  
                 "পদ্ধতি ২:\n"  
                 "Telegram → Settings → Devices → Link Desktop Device → QR Scan করুন।"  
@@ -341,7 +342,7 @@ async def wait_for_qr_login(user_id):
         except SessionPasswordNeededError:  
             await bot.send_message(  
                 user_id,  
-                "⚠️ আপনার Telegram account-এ 2-Step Verification চালু আছে。\n\n"  
+                "⚠️ আপনার Telegram account-এ 2-Step Verification চালু আছে।\n\n"  
                 "দয়া করে Phone Number Login পদ্ধতি ব্যবহার করুন অথবা 2FA password দিন।"  
             )  
             return  
@@ -401,10 +402,18 @@ async def process_phone_number(message: Message, state: FSMContext):
         }
 
         await state.set_state(PhoneLoginState.waiting_code)
+        
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Resend Code", callback_data="connect_phone")]
+            ]
+        )
+        
         await message.answer(
             "📩 আপনার Telegram অ্যাপে একটি কোড (OTP) পাঠানো হয়েছে।\n\n"
-            "কোডটি এখানে দিন (উদাহরণস্বরূপ: <code>12345</code>):",
-            parse_mode="HTML"
+            "কোডটি দ্রুত এখানে দিন (উদাহরণস্বরূপ: <code>12345</code>):",
+            parse_mode="HTML",
+            reply_markup=keyboard
         )
 
     except PhoneNumberInvalidError:
@@ -447,7 +456,7 @@ async def process_phone_code(message: Message, state: FSMContext):
 
         await message.answer(
             "✅ <b>Telegram Connected Successfully!</b>\n\n"
-            "এখন Target ও Live Channel সেট করুন。",
+            "এখন Target ও Live Channel সেট করুন।",
             parse_mode="HTML",
             reply_markup=main_keyboard()
         )
@@ -455,15 +464,25 @@ async def process_phone_code(message: Message, state: FSMContext):
     except SessionPasswordNeededError:
         await state.set_state(PhoneLoginState.waiting_password)
         await message.answer(
-            "🔐 আপনার অ্যাকাউন্টে <b>2-Step Verification (2FA)</b> চালু আছে。\n\n"
+            "🔐 আপনার অ্যাকাউন্টে <b>2-Step Verification (2FA)</b> চালু আছে।\n\n"
             "দয়া করে আপনার ক্লাউড পাসওয়ার্ডটি (2FA Password) এখানে পাঠান:",
             parse_mode="HTML"
         )
-    except PhoneCodeInvalidError:
-        await message.answer("❌ কোডটি ভুল হয়েছে। সঠিক কোডটি আবার দিন:")
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Try Again / Resend Code", callback_data="connect_phone")]
+            ]
+        )
+        await message.answer("❌ কোডটি ভুল অথবা মেয়াদোত্তীর্ণ হয়েছে। দয়া করে আবার চেষ্টা করুন:", reply_markup=keyboard)
     except Exception as e:
         logger.exception(e)
-        await message.answer(f"❌ লগইন ব্যর্থ হয়েছে:\n\n{e}")
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Try Again", callback_data="connect_phone")]
+            ]
+        )
+        await message.answer(f"❌ লগইন ব্যর্থ হয়েছে:\n\n{e}", reply_markup=keyboard)
         await state.clear()
         phone_login_data.pop(user_id, None)
 
@@ -523,7 +542,7 @@ async def check_connection(call: CallbackQuery):
             db.commit()  
             await call.message.answer("✅ Telegram Connected!", reply_markup=main_keyboard())  
         else:  
-            await call.message.answer("⏳ এখনও Connected হয়নি。\n\nআগে QR Scan বা Connect button ব্যবহার করুন।")  
+            await call.message.answer("⏳ এখনও Connected হয়নি।\n\nআগে QR Scan বা Connect button ব্যবহার করুন।")  
     except Exception as e:  
         await call.message.answer(f"❌ Connection check failed:\n{e}")
 
@@ -569,14 +588,14 @@ async def target_start(message, state):
             "🎯 <b>Target Channel</b>\n\n"  
             f"📺 {old['title']}\n"  
             f"🔗 {old['channel_username']}\n\n"  
-            "এই Channel-এর সদস্যদের Live-এ শনাক্ত করা হবে。\n\n"  
+            "এই Channel-এর সদস্যদের Live-এ শনাক্ত করা হবে।\n\n"  
             "পরিবর্তন করতে নতুন @username পাঠান।",  
             parse_mode="HTML"  
         )  
     else:  
         await message.answer(  
             "🎯 <b>Target Channel</b>\n\n"  
-            "যে Channel-এর সদস্যদের Live-এ Allow to Speak করতে চান সেই Channel-এর username পাঠান。\n\n"  
+            "যে Channel-এর সদস্যদের Live-এ Allow to Speak করতে চান সেই Channel-এর username পাঠান।\n\n"  
             "উদাহরণ:\n"  
             "<code>@MyTargetChannel</code>",  
             parse_mode="HTML"  
@@ -626,7 +645,7 @@ async def live_start(message, state):
     else:  
         await message.answer(  
             "📺 <b>Live Stream Channel</b>\n\n"  
-            "যে Channel-এ Telegram Live চলবে সেই Channel-এর username পাঠান。\n\n"  
+            "যে Channel-এ Telegram Live চলবে সেই Channel-এর username পাঠান।\n\n"  
             "উদাহরণ:\n"  
             "<code>@MyLiveChannel</code>",  
             parse_mode="HTML"  
@@ -703,7 +722,7 @@ async def save_channel(message, state, channel_type):
 
     except Exception as e:  
         logger.exception(e)  
-        await message.answer(f"❌ Channel add করা যায়নি。\n\n{e}")  
+        await message.answer(f"❌ Channel add করা যায়নি।\n\n{e}")  
         await state.clear()
 
 def get_channel(owner_id, channel_type):
