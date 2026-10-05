@@ -1,11 +1,12 @@
 import os
-import sys
+import io
+import time
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime
 
 from dotenv import load_dotenv
+
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -14,1378 +15,1294 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    BufferedInputFile,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 from telethon import TelegramClient, functions, types
-from telethon.errors import RPCError
+from telethon.errors import (
+    RPCError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    PasswordHashInvalidError
+)
 
+import qrcode
 
-# ============================================================
-# CONFIG
-# ============================================================
+=========================================================
+ENVIRONMENT
+=========================================================
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = os.getenv("API_ID")
-API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
 
-PORT = int(os.getenv("PORT", "10000"))
+try:
+    API_ID = int(os.getenv("API_ID", "0"))
+except ValueError:
+    API_ID = 0
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
+    raise RuntimeError("BOT_TOKEN missing")
 
 if not API_ID:
-    raise RuntimeError("API_ID is missing")
+    raise RuntimeError("API_ID missing")
 
 if not API_HASH:
-    raise RuntimeError("API_HASH is missing")
+    raise RuntimeError("API_HASH missing")
 
-API_ID = int(API_ID)
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DB_FILE = os.path.join(BASE_DIR, "speaker_manager.db")
-SESSION_DIR = os.path.join(BASE_DIR, "sessions")
-
-os.makedirs(SESSION_DIR, exist_ok=True)
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+=========================================================
+LOGGING
+=========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logger = logging.getLogger("speaker-manager")
+logger = logging.getLogger("AutoSpeaker")
 
+=========================================================
+DATABASE
+=========================================================
 
-# ============================================================
-# DATABASE
-# ============================================================
+DB_FILE = "speaker_manager.db"
 
-db = sqlite3.connect(DB_FILE, check_same_thread=False)
-
-db.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    session_name TEXT NOT NULL,
-    connected INTEGER DEFAULT 0,
-    created_at TEXT NOT NULL
+db = sqlite3.connect(
+    DB_FILE,
+    check_same_thread=False
 )
-""")
 
-db.execute("""
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER NOT NULL,
-    channel_type TEXT NOT NULL,
-    channel_username TEXT,
-    channel_id INTEGER,
-    title TEXT,
-    active INTEGER DEFAULT 1,
-    auto_allow INTEGER DEFAULT 1,
-    created_at TEXT NOT NULL,
-    UNIQUE(owner_id, channel_type)
+db.row_factory = sqlite3.Row
+
+def init_db():
+    db.execute("""  
+        CREATE TABLE IF NOT EXISTS users (  
+            user_id INTEGER PRIMARY KEY,  
+            session_name TEXT,  
+            connected INTEGER DEFAULT 0,  
+            created_at INTEGER  
+        )  
+    """)  
+
+    db.execute("""  
+        CREATE TABLE IF NOT EXISTS channels (  
+            id INTEGER PRIMARY KEY AUTOINCREMENT,  
+            owner_id INTEGER NOT NULL,  
+            channel_type TEXT NOT NULL,  
+            channel_username TEXT NOT NULL,  
+            channel_id INTEGER,  
+            title TEXT,  
+            active INTEGER DEFAULT 1,  
+            auto_allow INTEGER DEFAULT 1,  
+            created_at INTEGER,  
+            UNIQUE(owner_id, channel_type)  
+        )  
+    """)  
+    db.commit()
+
+init_db()
+
+=========================================================
+DIRECTORIES
+=========================================================
+
+os.makedirs(
+    "sessions",
+    exist_ok=True
 )
-""")
 
-db.commit()
+=========================================================
+BOT
+=========================================================
 
+bot = Bot(
+    BOT_TOKEN
+)
 
-# ============================================================
-# TELETHON CLIENTS
-# ============================================================
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+=========================================================
+TELETHON CLIENTS & LOGIN STATES
+=========================================================
 
 clients = {}
+login_tasks = {}
+phone_login_data = {}  # Store temporary login info (phone, code_hash, etc.)
 
-monitor_task = None
-
-
-def session_path(user_id: int) -> str:
+def session_path(user_id):
     return os.path.join(
-        SESSION_DIR,
+        "sessions",
         f"user_{user_id}"
     )
 
-
-def get_or_create_client(user_id: int):
+def get_client(user_id):
     if user_id not in clients:
         clients[user_id] = TelegramClient(
             session_path(user_id),
             API_ID,
-            API_HASH,
+            API_HASH
         )
-
     return clients[user_id]
 
-
-# ============================================================
-# DATABASE HELPERS
-# ============================================================
-
-def create_user_if_needed(user_id: int):
-
-    row = db.execute(
-        "SELECT user_id FROM users WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
-
-    if not row:
-
-        db.execute(
-            """
-            INSERT INTO users
-            (user_id, session_name, connected, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                f"user_{user_id}",
-                0,
-                datetime.utcnow().isoformat(),
-            ),
-        )
-
-        db.commit()
-
-
-def set_connected(user_id: int, connected: bool):
-
-    create_user_if_needed(user_id)
-
-    db.execute(
-        """
-        UPDATE users
-        SET connected=?
-        WHERE user_id=?
-        """,
-        (
-            1 if connected else 0,
-            user_id,
-        ),
-    )
-
-    db.commit()
-
-
-def get_connected(user_id: int):
-
-    row = db.execute(
-        """
-        SELECT connected
-        FROM users
-        WHERE user_id=?
-        """,
-        (user_id,),
-    ).fetchone()
-
-    return bool(row and row[0])
-
-
-def save_channel(
-    owner_id: int,
-    channel_type: str,
-    username: str,
-    channel_id: int,
-    title: str,
-):
-
-    db.execute(
-        """
-        INSERT INTO channels
-        (
-            owner_id,
-            channel_type,
-            channel_username,
-            channel_id,
-            title,
-            active,
-            auto_allow,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, 1, 1, ?)
-
-        ON CONFLICT(owner_id, channel_type)
-        DO UPDATE SET
-            channel_username=excluded.channel_username,
-            channel_id=excluded.channel_id,
-            title=excluded.title,
-            active=1
-        """,
-        (
-            owner_id,
-            channel_type,
-            username,
-            channel_id,
-            title,
-            datetime.utcnow().isoformat(),
-        ),
-    )
-
-    db.commit()
-
-
-def get_channel(owner_id: int, channel_type: str):
-
-    return db.execute(
-        """
-        SELECT
-            channel_username,
-            channel_id,
-            title,
-            active,
-            auto_allow
-        FROM channels
-        WHERE owner_id=?
-        AND channel_type=?
-        """,
-        (
-            owner_id,
-            channel_type,
-        ),
-    ).fetchone()
-
-
-def get_all_users():
-
-    return db.execute(
-        """
-        SELECT user_id
-        FROM users
-        WHERE connected=1
-        """
-    ).fetchall()
-
-
-# ============================================================
-# AIROGRAM
-# ============================================================
-
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
-
-dp.include_router(router)
-
-
-# ============================================================
-# STATES
-# ============================================================
+=========================================================
+STATES
+=========================================================
 
 class TargetChannelState(StatesGroup):
     waiting_channel = State()
 
-
 class LiveChannelState(StatesGroup):
     waiting_channel = State()
 
+class PhoneLoginState(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
-# ============================================================
-# KEYBOARDS
-# ============================================================
+=========================================================
+REPLY KEYBOARD
+=========================================================
 
-main_keyboard = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🔐 Connect Telegram",
-                callback_data="connect"
-            )
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(
+                    text="🔐 Connect Telegram"
+                ),
+                KeyboardButton(
+                    text="🎯 Target Channel"
+                )
+            ],
+            [
+                KeyboardButton(
+                    text="📺 Live Stream Channel"
+                ),
+                KeyboardButton(
+                    text="📊 Live Status"
+                )
+            ],
+            [
+                KeyboardButton(
+                    text="ℹ️ Help"
+                )
+            ]
         ],
-        [
-            InlineKeyboardButton(
-                text="🎯 Target Channel",
-                callback_data="target"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="📺 Live Stream Channel",
-                callback_data="live"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="📊 Live Status",
-                callback_data="status"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="ℹ️ Help",
-                callback_data="help"
-            )
-        ],
-    ]
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+=========================================================
+INLINE MAIN MENU
+=========================================================
+
+def main_menu():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔐 Connect Telegram",
+                    callback_data="connect"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎯 Target Channel",
+                    callback_data="target"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📺 Live Stream Channel",
+                    callback_data="live"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Live Status",
+                    callback_data="status"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="ℹ️ Help",
+                    callback_data="help"
+                )
+            ]
+        ]
+    )
+
+=========================================================
+START
+=========================================================
+
+@router.message(CommandStart())
+async def start_handler(
+    message: Message
+):
+    await message.answer(  
+        "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\n"  
+        "Target Channel-এর সদস্যরা "  
+        "Live Stream Channel-এর Live-এ "  
+        "join করলে তাদের speaking permission "  
+        "দেওয়ার চেষ্টা করবে।\n\n"  
+        "প্রথমে নিচের থেকে "  
+        "🔐 Connect Telegram করুন।",  
+        parse_mode="HTML",  
+        reply_markup=main_keyboard()  
+    )  
+    await message.answer(  
+        "👇 Control Panel:",  
+        reply_markup=main_menu()  
+    )
+
+=========================================================
+HELP
+=========================================================
+
+async def send_help(
+    message
+):
+    await message.answer(  
+        "ℹ️ <b>কিভাবে কাজ করবে</b>\n\n"  
+        "1️⃣ 🔐 Connect Telegram করুন (QR Code অথবা Phone Number দিয়ে)\n\n"  
+        "2️⃣ 🎯 Target Channel সেট করুন\n"  
+        "এই Channel-এর সদস্যদের শনাক্ত করা হবে।\n\n"  
+        "3️⃣ 📺 Live Stream Channel সেট করুন\n"  
+        "এই Channel-এ Telegram Live চলবে।\n\n"  
+        "4️⃣ Live শুরু করুন\n\n"  
+        "5️⃣ Target Channel-এর কোনো সদস্য "  
+        "Live-এ join করলে bot তাকে শনাক্ত করবে।\n\n"  
+        "6️⃣ Bot speaking permission দেওয়ার "  
+        "চেষ্টা করবে।\n\n"  
+        "⚠️ Live Stream Channel-এ connected "  
+        "Telegram account-এর প্রয়োজনীয় "  
+        "admin/manage-call permission থাকতে হবে।\n\n"  
+        "⚠️ RTMP livestream হলে Telegram API "  
+        "দিয়ে participant unmute করা যায় না।",  
+        parse_mode="HTML",  
+        reply_markup=main_keyboard()  
+    )
+
+@router.message(
+    F.text == "ℹ️ Help"
 )
-
-
-# ============================================================
-# START
-# ============================================================
-
-@router.message(F.text == "/start")
-async def start_handler(message: Message):
-
-    create_user_if_needed(message.from_user.id)
-
-    text = (
-        "👋 <b>Auto Speaker Manager</b>\n\n"
-
-        "এই বট Target Channel-এর সদস্যদের "
-        "Live Stream-এর participant হিসেবে monitor করার জন্য তৈরি।\n\n"
-
-        "⚙️ Workflow:\n"
-        "1️⃣ Telegram User Account connect করুন\n"
-        "2️⃣ Target Channel সেট করুন\n"
-        "3️⃣ Live Stream Channel সেট করুন\n"
-        "4️⃣ Live চালু হলে participant monitor হবে\n"
-        "5️⃣ Target member হলে speaking permission দেওয়ার চেষ্টা করবে\n\n"
-
-        "👇 নিচের Control Panel ব্যবহার করুন।"
-    )
-
-    await message.answer(
-        text,
-        reply_markup=main_keyboard,
-        parse_mode="HTML",
-    )
-
-
-# ============================================================
-# CONNECT
-# ============================================================
-
-@router.callback_query(F.data == "connect")
-async def connect_handler(callback: CallbackQuery):
-
-    user_id = callback.from_user.id
-
-    create_user_if_needed(user_id)
-
-    client = get_or_create_client(user_id)
-
-    try:
-
-        await client.connect()
-
-        authorized = await client.is_user_authorized()
-
-        if authorized:
-
-            me = await client.get_me()
-
-            set_connected(user_id, True)
-
-            name = (
-                getattr(me, "first_name", None)
-                or getattr(me, "username", None)
-                or "Telegram User"
-            )
-
-            await callback.message.answer(
-                "✅ <b>Telegram already connected</b>\n\n"
-                f"Account: <b>{name}</b>\n\n"
-                "এখন Target Channel এবং Live Stream Channel সেট করুন।",
-                parse_mode="HTML",
-            )
-
-        else:
-
-            await callback.message.answer(
-                "🔐 <b>Telegram account এখনো connected নয়।</b>\n\n"
-
-                "এই Bot-এর ভিতরে OTP বা 2FA password নেওয়া হবে না।\n\n"
-
-                "প্রথমে trusted computer/Termux/terminal-এ চালান:\n\n"
-
-                "<code>python main.py --login "
-                f"{user_id}</code>\n\n"
-
-                "Terminal-এ Telegram phone number, login code এবং "
-                "প্রয়োজনে 2FA password দিতে হবে।\n\n"
-
-                "Login শেষ হলে এই Bot-এ আবার "
-                "🔐 Connect Telegram চাপুন।",
-                parse_mode="HTML",
-            )
-
-    except Exception as e:
-
-        logger.exception("Connect error")
-
-        await callback.message.answer(
-            "❌ Telegram connection check failed.\n\n"
-            f"<code>{str(e)[:500]}</code>",
-            parse_mode="HTML",
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# TARGET CHANNEL
-# ============================================================
-
-@router.callback_query(F.data == "target")
-async def target_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
+async def help_text_handler(
+    message: Message
 ):
+    await send_help(message)
 
-    user_id = callback.from_user.id
-
-    if not get_connected(user_id):
-
-        await callback.message.answer(
-            "⚠️ আগে 🔐 Connect Telegram করুন।"
-        )
-
-        await callback.answer()
-        return
-
-    await state.set_state(
-        TargetChannelState.waiting_channel
+@router.callback_query(
+    F.data == "help"
+)
+async def help_callback(
+    call: CallbackQuery
+):
+    await call.answer()  
+    await call.message.answer(  
+        "ℹ️ Help",  
+        reply_markup=main_keyboard()  
+    )  
+    await send_help(  
+        call.message  
     )
 
-    await callback.message.answer(
-        "🎯 <b>Target Channel</b>\n\n"
-        "Channel-এর @username অথবা public link পাঠান।\n\n"
-        "উদাহরণ:\n"
-        "<code>@examplechannel</code>",
-        parse_mode="HTML",
-    )
+=========================================================
+CONNECT TELEGRAM (CHOOSE METHOD)
+=========================================================
 
-    await callback.answer()
-
-
-@router.message(TargetChannelState.waiting_channel)
-async def target_channel_received(
+@router.message(
+    F.text == "🔐 Connect Telegram"
+)
+async def connect_text_handler(
     message: Message,
-    state: FSMContext,
+    state: FSMContext
 ):
+    await connect_telegram_menu(message, state)
 
-    user_id = message.from_user.id
-
-    username = message.text.strip()
-
-    if username.startswith("https://t.me/"):
-        username = username.replace(
-            "https://t.me/",
-            ""
-        )
-
-    username = username.rstrip("/")
-
-    if not username.startswith("@"):
-        username = "@" + username
-
-    client = get_or_create_client(user_id)
-
-    try:
-
-        await client.connect()
-
-        if not await client.is_user_authorized():
-
-            await message.answer(
-                "❌ Telegram account connected নেই।"
-            )
-
-            await state.clear()
-            return
-
-        entity = await client.get_entity(username)
-
-        title = getattr(
-            entity,
-            "title",
-            username,
-        )
-
-        channel_id = entity.id
-
-        save_channel(
-            owner_id=user_id,
-            channel_type="target",
-            username=username,
-            channel_id=channel_id,
-            title=title,
-        )
-
-        await message.answer(
-            "✅ <b>Target Channel saved</b>\n\n"
-            f"📌 {title}\n"
-            f"🔗 {username}",
-            parse_mode="HTML",
-        )
-
-    except Exception as e:
-
-        logger.exception("Target channel error")
-
-        await message.answer(
-            "❌ Target Channel সেট করা যায়নি।\n\n"
-            "Username/link ঠিক আছে কিনা এবং connected "
-            "Telegram account channel-টি দেখতে পারে কিনা যাচাই করুন।\n\n"
-            f"<code>{str(e)[:500]}</code>",
-            parse_mode="HTML",
-        )
-
-    await state.clear()
-
-
-# ============================================================
-# LIVE CHANNEL
-# ============================================================
-
-@router.callback_query(F.data == "live")
-async def live_handler(
-    callback: CallbackQuery,
-    state: FSMContext,
+@router.callback_query(
+    F.data == "connect"
+)
+async def connect_callback(
+    call: CallbackQuery,
+    state: FSMContext
 ):
+    await call.answer()  
+    await connect_telegram_menu(call.message, state)
 
-    user_id = callback.from_user.id
-
-    if not get_connected(user_id):
-
-        await callback.message.answer(
-            "⚠️ আগে 🔐 Connect Telegram করুন।"
-        )
-
-        await callback.answer()
-        return
-
-    await state.set_state(
-        LiveChannelState.waiting_channel
-    )
-
-    await callback.message.answer(
-        "📺 <b>Live Stream Channel</b>\n\n"
-        "যে Channel-এ Live চালাবে তার @username অথবা "
-        "public link পাঠান।",
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-@router.message(LiveChannelState.waiting_channel)
-async def live_channel_received(
+async def connect_telegram_menu(
     message: Message,
-    state: FSMContext,
+    state: FSMContext
 ):
+    user_id = message.chat.id  
+    client = get_client(user_id)  
 
-    user_id = message.from_user.id
+    try:  
+        await client.connect()  
+        if await client.is_user_authorized():  
+            db.execute(  
+                """  
+                INSERT OR REPLACE INTO users  
+                (user_id, session_name, connected, created_at)  
+                VALUES (?, ?, 1, ?)  
+                """,  
+                (user_id, session_path(user_id), int(time.time()))  
+            )  
+            db.commit()  
+            await message.answer(  
+                "✅ <b>Telegram Already Connected</b>\n\n"  
+                "এখন Target ও Live Channel সেট করুন।",  
+                parse_mode="HTML",  
+                reply_markup=main_keyboard()  
+            )  
+            return  
 
-    username = message.text.strip()
-
-    if username.startswith("https://t.me/"):
-        username = username.replace(
-            "https://t.me/",
-            ""
-        )
-
-    username = username.rstrip("/")
-
-    if not username.startswith("@"):
-        username = "@" + username
-
-    client = get_or_create_client(user_id)
-
-    try:
-
-        await client.connect()
-
-        if not await client.is_user_authorized():
-
-            await message.answer(
-                "❌ Telegram account connected নেই।"
-            )
-
-            await state.clear()
-            return
-
-        entity = await client.get_entity(username)
-
-        title = getattr(
-            entity,
-            "title",
-            username,
-        )
-
-        channel_id = entity.id
-
-        save_channel(
-            owner_id=user_id,
-            channel_type="live",
-            username=username,
-            channel_id=channel_id,
-            title=title,
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📷 Connect via QR Code",
+                        callback_data="connect_qr"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="📱 Connect via Phone Number (OTP)",
+                        callback_data="connect_phone"
+                    )
+                ]
+            ]
         )
 
         await message.answer(
-            "✅ <b>Live Stream Channel saved</b>\n\n"
-            f"📺 {title}\n"
-            f"🔗 {username}\n\n"
-
-            "⚠️ Live পরিচালনার জন্য connected Telegram "
-            "account-কে Channel-এর প্রয়োজনীয় admin "
-            "permission দিতে হবে।",
+            "🔐 <b>Choose Login Method</b>\n\n"
+            "আপনি কোন মাধ্যমে আপনার Telegram অ্যাকাউন্ট কানেক্ট করতে চান তা নিচে থেকে সিলেক্ট করুন:",
             parse_mode="HTML",
+            reply_markup=keyboard
         )
 
-    except Exception as e:
-
-        logger.exception("Live channel error")
-
-        await message.answer(
-            "❌ Live Channel সেট করা যায়নি।\n\n"
-            f"<code>{str(e)[:500]}</code>",
-            parse_mode="HTML",
+    except Exception as e:  
+        logger.exception(e)  
+        await message.answer(  
+            f"❌ Telegram connect করা যায়নি:\n\n{e}"  
         )
 
+=========================================================
+QR LOGIN PROCESS
+=========================================================
+
+@router.callback_query(
+    F.data == "connect_qr"
+)
+async def connect_qr_callback(
+    call: CallbackQuery,
+    state: FSMContext
+):
+    await call.answer()
     await state.clear()
-
-
-# ============================================================
-# GET ACTIVE CALL
-# ============================================================
-
-async def get_active_call(client, entity):
+    message = call.message
+    user_id = message.chat.id
+    client = get_client(user_id)
 
     try:
-
-        full = await client(
-            functions.channels.GetFullChannelRequest(
-                channel=entity
-            )
-        )
-
-        return getattr(
-            full.full_chat,
-            "call",
-            None,
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Unable to get active call"
-        )
-
-        return None
-
-
-# ============================================================
-# GET PARTICIPANTS
-# ============================================================
-
-async def get_participants(
-    client,
-    call,
-):
-
-    try:
-
-        input_call = types.InputGroupCall(
-            id=call.id,
-            access_hash=call.access_hash,
-        )
-
-        result = await client(
-            functions.phone.GetGroupCallRequest(
-                call=input_call,
-                limit=100,
-            )
-        )
-
-        return result.participants or []
-
-    except Exception:
-
-        logger.exception(
-            "Unable to get participants"
-        )
-
-        return []
-
-
-# ============================================================
-# TARGET MEMBERSHIP
-# ============================================================
-
-async def is_target_member(
-    client,
-    target_entity,
-    user_id,
-):
-
-    try:
-
-        result = await client(
-            functions.channels.GetParticipantRequest(
-                channel=target_entity,
-                participant=user_id,
-            )
-        )
-
-        participant = result.participant
-
-        if isinstance(
-            participant,
-            (
-                types.ChannelParticipantLeft,
-                types.ChannelParticipantBanned,
-            )
-        ):
-            return False
-
-        return True
-
-    except RPCError:
-
-        return False
-
-    except Exception:
-
-        return False
-
-
-# ============================================================
-# ALLOW / UNMUTE ATTEMPT
-# ============================================================
-
-async def allow_participant(
-    client,
-    call,
-    user_id,
-):
-
-    try:
-
-        input_call = types.InputGroupCall(
-            id=call.id,
-            access_hash=call.access_hash,
-        )
-
-        participant = types.InputPeerUser(
-            user_id=user_id,
-            access_hash=0,
-        )
-
-        await client(
-            functions.phone.EditGroupCallParticipantRequest(
-                call=input_call,
-                participant=participant,
-                muted=False,
-            )
-        )
-
-        return True, "permission request sent"
-
-    except RPCError as e:
-
-        return False, str(e)
-
-    except Exception as e:
-
-        return False, str(e)
-
-
-# ============================================================
-# MONITOR ONE USER
-# ============================================================
-
-async def monitor_user(user_id):
-
-    target = get_channel(
-        user_id,
-        "target",
-    )
-
-    live = get_channel(
-        user_id,
-        "live",
-    )
-
-    if not target or not live:
-        return
-
-    client = get_or_create_client(user_id)
-
-    try:
-
         if not client.is_connected():
-
             await client.connect()
 
-        if not await client.is_user_authorized():
+        login = await client.qr_login()  
+        login_tasks[user_id] = login  
 
-            set_connected(
-                user_id,
-                False,
-            )
+        qr_image = qrcode.make(login.url)  
+        buffer = io.BytesIO()  
+        qr_image.save(buffer, format="PNG")  
+        buffer.seek(0)  
 
-            return
+        photo = BufferedInputFile(  
+            buffer.read(),  
+            filename="telegram_login_qr.png"  
+        )  
 
-        target_username = target[0]
-        live_username = live[0]
+        keyboard = InlineKeyboardMarkup(  
+            inline_keyboard=[  
+                [  
+                    InlineKeyboardButton(  
+                        text="📱 Connect via Telegram",  
+                        url=login.url  
+                    )  
+                ],  
+                [  
+                    InlineKeyboardButton(  
+                        text="🔄 Check Connection",  
+                        callback_data="check_connection"  
+                    )  
+                ]  
+            ]  
+        )  
 
-        target_entity = await client.get_entity(
-            target_username
+        await message.answer_photo(  
+            photo=photo,  
+            caption=(  
+                "🔐 <b>Connect via QR Code</b>\n\n"  
+                "পদ্ধতি ১:\n"  
+                "নিচের <b>Connect via Telegram</b> button চাপুন।\n\n"  
+                "অথবা\n\n"  
+                "পদ্ধতি ২:\n"  
+                "Telegram → Settings → Devices → Link Desktop Device → QR Scan করুন।"  
+            ),  
+            parse_mode="HTML",  
+            reply_markup=keyboard  
+        )  
+
+        await message.answer(  
+            "⏳ <b>Connection অপেক্ষা করছে...</b>\n\n"  
+            "Telegram login সম্পন্ন করলে automatically connected হবে।",  
+            parse_mode="HTML"  
+        )  
+
+        asyncio.create_task(  
+            wait_for_qr_login(user_id)  
         )
 
-        live_entity = await client.get_entity(
-            live_username
-        )
+    except Exception as e:
+        logger.exception(e)
+        await message.answer(f"❌ QR Login শুরু করা যায়নি:\n\n{e}")
 
-        call = await get_active_call(
-            client,
-            live_entity,
-        )
-
-        if not call:
-            return
-
-        participants = await get_participants(
-            client,
-            call,
-        )
-
-        for participant in participants:
-
-            peer = getattr(
-                participant,
-                "peer",
-                None,
-            )
-
-            if not isinstance(
-                peer,
-                types.PeerUser,
-            ):
-                continue
-
-            user_id_in_call = peer.user_id
-
-            is_member = await is_target_member(
-                client,
-                target_entity,
-                user_id_in_call,
-            )
-
-            if not is_member:
-                continue
-
-            muted = getattr(
-                participant,
-                "muted",
-                False,
-            )
-
-            if muted:
-
-                success, reason = await allow_participant(
-                    client,
-                    call,
-                    user_id_in_call,
-                )
-
-                if success:
-
-                    logger.info(
-                        "Speaking permission attempted: "
-                        "owner=%s participant=%s",
-                        user_id,
-                        user_id_in_call,
-                    )
-
-                else:
-
-                    logger.warning(
-                        "Could not allow participant: "
-                        "owner=%s participant=%s reason=%s",
-                        user_id,
-                        user_id_in_call,
-                        reason,
-                    )
-
-    except Exception:
-
-        logger.exception(
-            "Monitor error for user %s",
-            user_id,
-        )
-
-
-# ============================================================
-# AUTO MONITOR
-# ============================================================
-
-async def auto_monitor():
-
-    logger.info(
-        "Auto monitor started"
-    )
-
-    while True:
-
-        try:
-
-            users = get_all_users()
-
-            for row in users:
-
-                user_id = row[0]
-
-                try:
-
-                    await monitor_user(
-                        user_id
-                    )
-
-                except Exception:
-
-                    logger.exception(
-                        "User monitor failed: %s",
-                        user_id,
-                    )
-
-        except Exception:
-
-            logger.exception(
-                "Monitor loop error"
-            )
-
-        await asyncio.sleep(5)
-
-
-# ============================================================
-# LIVE STATUS
-# ============================================================
-
-@router.callback_query(F.data == "status")
-async def status_handler(
-    callback: CallbackQuery,
+async def wait_for_qr_login(
+    user_id
 ):
+    try:  
+        login = login_tasks.get(user_id)  
+        if not login:  
+            return  
 
-    user_id = callback.from_user.id
+        client = get_client(user_id)  
 
-    target = get_channel(
-        user_id,
-        "target",
+        try:  
+            await login.wait(timeout=180)  
+        except SessionPasswordNeededError:  
+            await bot.send_message(  
+                user_id,  
+                "⚠️ আপনার Telegram account-এ 2-Step Verification চালু আছে।\n\n"  
+                "দয়া করে Phone Number Login পদ্ধতি ব্যবহার করুন অথবা 2FA password দিন।"  
+            )  
+            return  
+
+        db.execute(  
+            """  
+            INSERT OR REPLACE INTO users  
+            (user_id, session_name, connected, created_at)  
+            VALUES (?, ?, 1, ?)  
+            """,  
+            (user_id, session_path(user_id), int(time.time()))  
+        )  
+        db.commit()  
+
+        await bot.send_message(  
+            user_id,  
+            "✅ <b>Telegram Connected!</b>\n\n"  
+            "এখন প্রথমে 🎯 Target Channel সেট করুন।",  
+            parse_mode="HTML",  
+            reply_markup=main_keyboard()  
+        )  
+
+    except Exception as e:  
+        logger.exception(e)  
+        try:  
+            await bot.send_message(user_id, f"❌ Login failed:\n\n{e}")  
+        except:  
+            pass  
+    finally:  
+        login_tasks.pop(user_id, None)
+
+=========================================================
+PHONE NUMBER & OTP LOGIN PROCESS
+=========================================================
+
+@router.callback_query(
+    F.data == "connect_phone"
+)
+async def connect_phone_callback(
+    call: CallbackQuery,
+    state: FSMContext
+):
+    await call.answer()
+    await state.set_state(PhoneLoginState.waiting_phone)
+    await call.message.answer(
+        "📱 <b>Phone Number দিয়ে লগইন</b>\n\n"
+        "আপনার Telegram অ্যাকাউন্টের ফোন নাম্বারটি কান্ট্রি কোডসহ পাঠান (যেমন: <code>+8801712345678</code>)",
+        parse_mode="HTML"
     )
 
-    live = get_channel(
-        user_id,
-        "live",
-    )
+@router.message(
+    PhoneLoginState.waiting_phone
+)
+async def process_phone_number(
+    message: Message,
+    state: FSMContext
+):
+    phone = message.text.strip()
+    user_id = message.chat.id
+    client = get_client(user_id)
 
-    if not target or not live:
+    try:
+        if not client.is_connected():
+            await client.connect()
 
-        await callback.message.answer(
-            "⚠️ আগে Target Channel এবং Live Stream Channel সেট করুন।"
+        sent_code = await client.send_code_request(phone)
+        
+        phone_login_data[user_id] = {
+            "phone": phone,
+            "phone_code_hash": sent_code.phone_code_hash
+        }
+
+        await state.set_state(PhoneLoginState.waiting_code)
+        await message.answer(
+            "📩 আপনার Telegram অ্যাপে একটি কোড (OTP) পাঠানো হয়েছে।\n\n"
+            "কোডটি এখানে দিন (উদাহরণস্বরূপ: যদি কোড 12345 হয়, তবে মাঝখানে স্পেস দিয়ে লিখতে পারেন যেমন <code>1 2 3 4 5</code> বা একসাথে <code>12345</code>):",
+            parse_mode="HTML"
         )
 
-        await callback.answer()
+    except PhoneNumberInvalidError:
+        await message.answer("❌ ফোন নাম্বারটি সঠিক নয়। দয়া করে সঠিক ফরম্যাটে আবার পাঠান (যেমন: <code>+8801712345678</code>):", parse_mode="HTML")
+    except Exception as e:
+        logger.exception(e)
+        await message.answer(f"❌ কোড পাঠানো যায়নি:\n\n{e}")
+        await state.clear()
+
+@router.message(
+    PhoneLoginState.waiting_code
+)
+async def process_phone_code(
+    message: Message,
+    state: FSMContext
+):
+    code = message.text.strip().replace(" ", "")
+    user_id = message.chat.id
+    client = get_client(user_id)
+    data = phone_login_data.get(user_id)
+
+    if not data:
+        await message.answer("❌ সেশন মেয়াদোত্তীর্ণ হয়ে গেছে। আবার চেষ্টা করুন।", reply_markup=main_keyboard())
+        await state.clear()
         return
 
-    client = get_or_create_client(user_id)
-
     try:
-
-        await client.connect()
-
-        if not await client.is_user_authorized():
-
-            await callback.message.answer(
-                "❌ Telegram account connected নেই।"
-            )
-
-            await callback.answer()
-            return
-
-        target_entity = await client.get_entity(
-            target[0]
+        await client.sign_in(
+            phone=data["phone"],
+            code=code,
+            phone_code_hash=data["phone_code_hash"]
         )
 
-        live_entity = await client.get_entity(
-            live[0]
+        # Successful login without 2FA
+        db.execute(
+            """  
+            INSERT OR REPLACE INTO users  
+            (user_id, session_name, connected, created_at)  
+            VALUES (?, ?, 1, ?)  
+            """,
+            (user_id, session_path(user_id), int(time.time()))
         )
+        db.commit()
+        await state.clear()
+        phone_login_data.pop(user_id, None)
 
-        call = await get_active_call(
-            client,
-            live_entity,
-        )
-
-        if not call:
-
-            await callback.message.answer(
-                "📴 বর্তমানে কোনো active Live পাওয়া যায়নি।"
-            )
-
-            await callback.answer()
-            return
-
-        participants = await get_participants(
-            client,
-            call,
-        )
-
-        total_target = 0
-        muted_count = 0
-        allowed_count = 0
-
-        for participant in participants:
-
-            peer = getattr(
-                participant,
-                "peer",
-                None,
-            )
-
-            if not isinstance(
-                peer,
-                types.PeerUser,
-            ):
-                continue
-
-            member = await is_target_member(
-                client,
-                target_entity,
-                peer.user_id,
-            )
-
-            if not member:
-                continue
-
-            total_target += 1
-
-            muted = getattr(
-                participant,
-                "muted",
-                False,
-            )
-
-            if muted:
-                muted_count += 1
-            else:
-                allowed_count += 1
-
-        text = (
-            "📊 <b>Live Status</b>\n\n"
-            f"👥 Target members in Live: "
-            f"<b>{total_target}</b>\n\n"
-            f"🔇 Muted: <b>{muted_count}</b>\n"
-            f"🎙 Allowed: <b>{allowed_count}</b>\n"
-        )
-
-        await callback.message.answer(
-            text,
+        await message.answer(
+            "✅ <b>Telegram Connected Successfully!</b>\n\n"
+            "এখন Target ও Live Channel সেট করুন।",
             parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
+    except SessionPasswordNeededError:
+        # 2FA password is required
+        await state.set_state(PhoneLoginState.waiting_password)
+        await message.answer(
+            "🔐 আপনার অ্যাকাউন্টে <b>2-Step Verification (2FA)</b> চালু আছে।\n\n"
+            "দয়া করে আপনার ক্লাউড পাসওয়ার্ডটি (2FA Password) এখানে পাঠান:",
+            parse_mode="HTML"
+        )
+    except PhoneCodeInvalidError:
+        await message.answer("❌ কোድটি ভুল হয়েছে। সঠিক কোডটি আবার দিন:")
     except Exception as e:
+        logger.exception(e)
+        await message.answer(f"❌ লগইন ব্যর্থ হয়েছে:\n\n{e}")
+        await state.clear()
+        phone_login_data.pop(user_id, None)
 
-        logger.exception(
-            "Status error"
-        )
-
-        await callback.message.answer(
-            "❌ Status পাওয়া যায়নি।\n\n"
-            f"<code>{str(e)[:500]}</code>",
-            parse_mode="HTML",
-        )
-
-    await callback.answer()
-
-
-# ============================================================
-# HELP
-# ============================================================
-
-@router.callback_query(F.data == "help")
-async def help_handler(
-    callback: CallbackQuery,
+@router.message(
+    PhoneLoginState.waiting_password
+)
+async def process_2fa_password(
+    message: Message,
+    state: FSMContext
 ):
-
-    text = (
-        "ℹ️ <b>How to use</b>\n\n"
-
-        "1️⃣ প্রথমে trusted terminal-এ:\n"
-        "<code>python main.py --login YOUR_BOT_USER_ID</code>\n\n"
-
-        "2️⃣ Telegram account login শেষ করুন।\n\n"
-
-        "3️⃣ Bot-এ 🔐 Connect Telegram চাপুন।\n\n"
-
-        "4️⃣ 🎯 Target Channel সেট করুন।\n\n"
-
-        "5️⃣ 📺 Live Stream Channel সেট করুন।\n\n"
-
-        "6️⃣ Live চালু হলে monitor কাজ করবে।\n\n"
-
-        "⚠️ Bot নিজে OTP বা 2FA password নেয় না।\n"
-        "⚠️ Session file কারও সাথে share করবেন না।"
-    )
-
-    await callback.message.answer(
-        text,
-        parse_mode="HTML",
-    )
-
-    await callback.answer()
-
-
-# ============================================================
-# HEALTH SERVER
-# ============================================================
-
-async def health(request):
-
-    return web.Response(
-        text="Auto Speaker Manager is running."
-    )
-
-
-async def health_server():
-
-    app = web.Application()
-
-    app.router.add_get(
-        "/",
-        health,
-    )
-
-    app.router.add_get(
-        "/health",
-        health,
-    )
-
-    runner = web.AppRunner(app)
-
-    await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
-    await site.start()
-
-    logger.info(
-        "Health server running on port %s",
-        PORT,
-    )
-
-    return runner
-
-
-# ============================================================
-# TELEGRAM SESSION LOGIN
-# ============================================================
-
-async def login_account(user_id: int):
-
-    client = TelegramClient(
-        session_path(user_id),
-        API_ID,
-        API_HASH,
-    )
-
-    print()
-    print("=" * 60)
-    print(" TELEGRAM USER ACCOUNT LOGIN")
-    print("=" * 60)
-    print()
-    print(f"Bot user ID: {user_id}")
-    print()
-    print(
-        "Your phone number, Telegram login code and "
-        "2FA password (if enabled) are entered ONLY "
-        "in this trusted terminal."
-    )
-    print()
-    print("They are NOT sent to the Telegram bot.")
-    print()
+    password = message.text.strip()
+    user_id = message.chat.id
+    client = get_client(user_id)
 
     try:
+        await client.sign_in(password=password)
 
-        await client.start()
+        db.execute(
+            """  
+            INSERT OR REPLACE INTO users  
+            (user_id, session_name, connected, created_at)  
+            VALUES (?, ?, 1, ?)  
+            """,
+            (user_id, session_path(user_id), int(time.time()))
+        )
+        db.commit()
+        await state.clear()
+        phone_login_data.pop(user_id, None)
 
-        me = await client.get_me()
-
-        print()
-        print("✅ LOGIN SUCCESSFUL")
-        print()
-
-        print(
-            "Account:",
-            getattr(me, "first_name", "") or "",
-            getattr(me, "last_name", "") or "",
+        await message.answer(
+            "✅ <b>2FA Password দিয়ে Telegram Connected!</b>\n\n"
+            "এখন Target ও Live Channel সেট করুন।",
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
-        print(
-            "Username:",
-            f"@{me.username}" if me.username else "none",
-        )
-
-        print()
-        print(
-            "Session created at:"
-        )
-
-        print(
-            session_path(user_id) + ".session"
-        )
-
-        create_user_if_needed(user_id)
-
-        set_connected(
-            user_id,
-            True,
-        )
-
-        print()
-        print(
-            "Now start the bot normally with:"
-        )
-
-        print()
-        print(
-            "python main.py"
-        )
-
-        print()
-
+    except PasswordHashInvalidError:
+        await message.answer("❌ 2FA পাসওয়ার্ড ভুল হয়েছে। সঠিক পাসওয়ার্ডটি আবার দিন:")
     except Exception as e:
+        logger.exception(e)
+        await message.answer(f"❌ লগইন সম্পন্ন করা যায়নি:\n\n{e}")
+        await state.clear()
+        phone_login_data.pop(user_id, None)
 
-        print()
-        print("❌ LOGIN FAILED")
-        print(str(e))
-        print()
+=========================================================
+CHECK CONNECTION
+=========================================================
 
-    finally:
+@router.callback_query(
+    F.data == "check_connection"
+)
+async def check_connection(
+    call: CallbackQuery
+):
+    await call.answer()  
+    user_id = call.from_user.id  
+    client = get_client(user_id)  
 
-        await client.disconnect()
+    try:  
+        await client.connect()  
+        if await client.is_user_authorized():  
+            db.execute(  
+                """  
+                INSERT OR REPLACE INTO users  
+                (user_id, session_name, connected, created_at)  
+                VALUES (?, ?, 1, ?)  
+                """,  
+                (user_id, session_path(user_id), int(time.time()))  
+            )  
+            db.commit()  
+            await call.message.answer(  
+                "✅ Telegram Connected!",  
+                reply_markup=main_keyboard()  
+            )  
+        else:  
+            await call.message.answer(  
+                "⏳ এখনও Connected হয়নি।\n\n"  
+                "আগে QR Scan বা Connect button ব্যবহার করুন।"  
+            )  
+    except Exception as e:  
+        await call.message.answer(  
+            f"❌ Connection check failed:\n{e}"  
+        )
 
+=========================================================
+CHECK USER CONNECTED
+=========================================================
 
-# ============================================================
-# MAIN
-# ============================================================
+def is_connected_user(user_id):
+    row = db.execute(  
+        """  
+        SELECT connected  
+        FROM users  
+        WHERE user_id=?  
+        """,  
+        (user_id,)  
+    ).fetchone()  
+    return bool(row and row["connected"])
+
+=========================================================
+TARGET CHANNEL MENU
+=========================================================
+
+@router.message(
+    F.text == "🎯 Target Channel"
+)
+async def target_text_handler(
+    message: Message,
+    state: FSMContext
+):
+    await target_start(message, state)
+
+@router.callback_query(
+    F.data == "target"
+)
+async def target_callback(
+    call: CallbackQuery,
+    state: FSMContext
+):
+    await call.answer()  
+    await target_start(call.message, state)
+
+async def target_start(message, state):
+    user_id = message.chat.id  
+    if not is_connected_user(user_id):  
+        await message.answer("❌ আগে 🔐 Connect Telegram করুন।")  
+        return  
+
+    old = db.execute(  
+        """  
+        SELECT *  
+        FROM channels  
+        WHERE owner_id=?  
+        AND channel_type='target'  
+        AND active=1  
+        """,  
+        (user_id,)  
+    ).fetchone()  
+
+    if old:  
+        await message.answer(  
+            "🎯 <b>Target Channel</b>\n\n"  
+            f"📺 {old['title']}\n"  
+            f"🔗 {old['channel_username']}\n\n"  
+            "এই Channel-এর সদস্যদের Live-এ শনাক্ত করা হবে।\n\n"  
+            "পরিবর্তন করতে নতুন @username পাঠান।",  
+            parse_mode="HTML"  
+        )  
+    else:  
+        await message.answer(  
+            "🎯 <b>Target Channel</b>\n\n"  
+            "যে Channel-এর সদস্যদের Live-এ Allow to Speak করতে চান সেই Channel-এর username পাঠান।\n\n"  
+            "উদাহরণ:\n"  
+            "<code>@MyTargetChannel</code>",  
+            parse_mode="HTML"  
+        )  
+
+    await state.set_state(TargetChannelState.waiting_channel)
+
+@router.message(
+    TargetChannelState.waiting_channel
+)
+async def save_target_channel(
+    message: Message,
+    state: FSMContext
+):
+    await save_channel(message, state, "target")
+
+=========================================================
+LIVE CHANNEL MENU
+=========================================================
+
+@router.message(
+    F.text == "📺 Live Stream Channel"
+)
+async def live_text_handler(
+    message: Message,
+    state: FSMContext
+):
+    await live_start(message, state)
+
+@router.callback_query(
+    F.data == "live"
+)
+async def live_callback(
+    call: CallbackQuery,
+    state: FSMContext
+):
+    await call.answer()  
+    await live_start(call.message, state)
+
+async def live_start(message, state):
+    user_id = message.chat.id  
+    if not is_connected_user(user_id):  
+        await message.answer("❌ আগে 🔐 Connect Telegram করুন।")  
+        return  
+
+    old = db.execute(  
+        """  
+        SELECT *  
+        FROM channels  
+        WHERE owner_id=?  
+        AND channel_type='live'  
+        AND active=1  
+        """,  
+        (user_id,)  
+    ).fetchone()  
+
+    if old:  
+        await message.answer(  
+            "📺 <b>Live Stream Channel</b>\n\n"  
+            f"📺 {old['title']}\n"  
+            f"🔗 {old['channel_username']}\n\n"  
+            "এই Channel-এ Live Stream চলবে।\n\n"  
+            "পরিবর্তন করতে নতুন @username পাঠান।",  
+            parse_mode="HTML"  
+        )  
+    else:  
+        await message.answer(  
+            "📺 <b>Live Stream Channel</b>\n\n"  
+            "যে Channel-এ Telegram Live চলবে সেই Channel-এর username পাঠান।\n\n"  
+            "উদাহরণ:\n"  
+            "<code>@MyLiveChannel</code>",  
+            parse_mode="HTML"  
+        )  
+
+    await state.set_state(LiveChannelState.waiting_channel)
+
+@router.message(
+    LiveChannelState.waiting_channel
+)
+async def save_live_channel(
+    message: Message,
+    state: FSMContext
+):
+    await save_channel(message, state, "live")
+
+=========================================================
+SAVE CHANNEL GENERIC
+=========================================================
+
+async def save_channel(message, state, channel_type):
+    username = (message.text or "").strip()  
+    if not username:  
+        await message.answer("❌ Channel username দিন।")  
+        return  
+
+    if not username.startswith("@"):  
+        username = "@" + username  
+
+    user_id = message.from_user.id  
+    client = get_client(user_id)  
+
+    try:  
+        await client.connect()  
+        if not await client.is_user_authorized():  
+            await message.answer("❌ Telegram account connected নেই।")  
+            await state.clear()  
+            return  
+
+        entity = await client.get_entity(username)  
+        title = getattr(entity, "title", username)  
+
+        await client(  
+            functions.channels.GetFullChannelRequest(  
+                channel=entity  
+            )  
+        )  
+
+        db.execute(  
+            """  
+            INSERT INTO channels  
+            (owner_id, channel_type, channel_username, channel_id, title, active, auto_allow, created_at)  
+            VALUES (?, ?, ?, ?, ?, 1, 1, ?)  
+            ON CONFLICT(owner_id, channel_type)  
+            DO UPDATE SET  
+                channel_username=excluded.channel_username,  
+                channel_id=excluded.channel_id,  
+                title=excluded.title,  
+                active=1,  
+                created_at=excluded.created_at  
+            """,  
+            (user_id, channel_type, username, entity.id, title, int(time.time()))  
+        )  
+        db.commit()  
+        await state.clear()  
+
+        if channel_type == "target":  
+            await message.answer(  
+                "✅ <b>Target Channel Added</b>\n\n"  
+                f"📺 {title}\n"  
+                f"🔗 {username}\n\n"  
+                "🎯 এই Channel-এর সদস্যদের Live-এ শনাক্ত করা হবে।\n\n"  
+                "এখন 📺 Live Stream Channel সেট করুন।",  
+                parse_mode="HTML",  
+                reply_markup=main_keyboard()  
+            )  
+        else:  
+            await message.answer(  
+                "✅ <b>Live Stream Channel Added</b>\n\n"  
+                f"📺 {title}\n"  
+                f"🔗 {username}\n\n"  
+                "🎙 এই Channel-এর Live monitor করা হবে।\n\n"  
+                "দুইটি Channel সেটআপ হয়ে গেছে।",  
+                parse_mode="HTML",  
+                reply_markup=main_keyboard()  
+            )  
+
+    except Exception as e:  
+        logger.exception(e)  
+        await message.answer("❌ Channel add করা যায়নি.\n\n" f"{e}")  
+        await state.clear()
+
+=========================================================
+GET CHANNEL
+=========================================================
+
+def get_channel(owner_id, channel_type):
+    return db.execute(  
+        """  
+        SELECT *  
+        FROM channels  
+        WHERE owner_id=?  
+        AND channel_type=?  
+        AND active=1  
+        """,  
+        (owner_id, channel_type)  
+    ).fetchone()
+
+=========================================================
+GET ACTIVE GROUP CALL
+=========================================================
+
+async def get_active_call(client, channel_username):
+    entity = await client.get_entity(channel_username)  
+    full = await client(  
+        functions.channels.GetFullChannelRequest(  
+            channel=entity  
+        )  
+    )  
+    call = getattr(full.full_chat, "call", None)  
+    return call, entity
+
+=========================================================
+GET LIVE PARTICIPANTS
+=========================================================
+
+async def get_participants(client, call):
+    input_call = types.InputGroupCall(  
+        id=call.id,  
+        access_hash=call.access_hash  
+    )  
+    result = await client(  
+        functions.phone.GetGroupCallRequest(  
+            call=input_call,  
+            limit=100,  
+            offset=0  
+        )  
+    )  
+    users = {user.id: user for user in result.users}  
+    return result.participants, users
+
+=========================================================
+CHECK TARGET CHANNEL MEMBER
+=========================================================
+
+async def is_target_member(client, target_entity, user):
+    try:  
+        participant = await client(  
+            functions.channels.GetParticipantRequest(  
+                channel=target_entity,  
+                participant=types.InputPeerUser(  
+                    user_id=user.id,  
+                    access_hash=user.access_hash  
+                )  
+            )  
+        )  
+        member = participant.participant  
+        if isinstance(  
+            member,  
+            (  
+                types.ChannelParticipantLeft,  
+                types.ChannelParticipantBanned  
+            )  
+        ):  
+            return False  
+        return True  
+    except Exception as e:  
+        logger.warning("Membership check failed for %s: %s", user.id, e)  
+        return False
+
+=========================================================
+ALLOW TO SPEAK
+=========================================================
+
+async def allow_participant(client, call, user):
+    input_call = types.InputGroupCall(  
+        id=call.id,  
+        access_hash=call.access_hash  
+    )  
+    participant = await client.get_input_entity(user)  
+    await client(  
+        functions.phone.EditGroupCallParticipantRequest(  
+            call=input_call,  
+            participant=participant,  
+            muted=False  
+        )  
+    )
+
+=========================================================
+MONITOR
+=========================================================
+
+async def monitor_user(user_id):
+    target_row = get_channel(user_id, "target")  
+    live_row = get_channel(user_id, "live")  
+
+    if not target_row or not live_row:  
+        return  
+
+    client = get_client(user_id)  
+
+    if not client.is_connected():  
+        await client.connect()  
+
+    if not await client.is_user_authorized():  
+        return  
+
+    try:  
+        call, live_entity = await get_active_call(  
+            client,  
+            live_row["channel_username"]  
+        )  
+        if not call:  
+            return  
+
+        target_entity = await client.get_entity(  
+            target_row["channel_username"]  
+        )  
+
+        participants, users = await get_participants(  
+            client,  
+            call  
+        )  
+
+        for participant in participants:  
+            peer = participant.peer  
+            if not isinstance(peer, types.PeerUser):  
+                continue  
+
+            user = users.get(peer.user_id)  
+            if not user:  
+                continue  
+
+            member = await is_target_member(  
+                client,  
+                target_entity,  
+                user  
+            )  
+            if not member:  
+                continue  
+
+            muted = getattr(participant, "muted", False)  
+            if not muted:  
+                continue  
+
+            try:  
+                await allow_participant(  
+                    client,  
+                    call,  
+                    user  
+                )  
+                logger.info(  
+                    "Target member allowed: %s | target=%s | live=%s",  
+                    user.id,  
+                    target_row["channel_username"],  
+                    live_row["channel_username"]  
+                )  
+            except Exception as e:  
+                logger.warning("Allow participant failed: %s", e)  
+
+            await asyncio.sleep(0.15)  
+
+    except Exception as e:  
+        logger.warning("Monitor error user=%s: %s", user_id, e)
+
+=========================================================
+GLOBAL MONITOR
+=========================================================
+
+async def auto_monitor():
+    logger.info("Auto Speaker Monitor Started")  
+    while True:  
+        try:  
+            rows = db.execute(  
+                """  
+                SELECT DISTINCT owner_id  
+                FROM channels  
+                WHERE active=1  
+                """  
+            ).fetchall()  
+
+            for row in rows:  
+                try:  
+                    await monitor_user(row["owner_id"])  
+                except Exception as e:  
+                    logger.warning("User monitor error: %s", e)  
+                await asyncio.sleep(0.5)  
+
+        except Exception as e:  
+            logger.exception(e)  
+
+        await asyncio.sleep(3)
+
+=========================================================
+LIVE STATUS
+=========================================================
+
+@router.message(
+    F.text == "📊 Live Status"
+)
+async def status_text_handler(
+    message: Message
+):
+    await live_status_message(message)
+
+@router.callback_query(
+    F.data == "status"
+)
+async def status_callback(
+    call: CallbackQuery
+):
+    await call.answer()  
+    await live_status_message(call.message)
+
+async def live_status_message(message):
+    user_id = message.chat.id  
+
+    target_row = get_channel(user_id, "target")  
+    live_row = get_channel(user_id, "live")  
+
+    if not target_row:  
+        await message.answer("❌ 🎯 Target Channel সেট করা হয়নি।")  
+        return  
+
+    if not live_row:  
+        await message.answer("❌ 📺 Live Stream Channel সেট করা হয়নি।")  
+        return  
+
+    client = get_client(user_id)  
+
+    try:  
+        await client.connect()  
+        call, live_entity = await get_active_call(  
+            client,  
+            live_row["channel_username"]  
+        )  
+
+        if not call:  
+            await message.answer(  
+                "🔴 <b>LIVE OFFLINE</b>\n\n"  
+                f"🎯 Target: {target_row['title']}\n"  
+                f"📺 Live: {live_row['title']}",  
+                parse_mode="HTML"  
+            )  
+            return  
+
+        participants, users = await get_participants(  
+            client,  
+            call  
+        )  
+
+        target_entity = await client.get_entity(  
+            target_row["channel_username"]  
+        )  
+
+        members = 0  
+        muted = 0  
+        allowed = 0  
+
+        for participant in participants:  
+            peer = participant.peer  
+            if not isinstance(peer, types.PeerUser):  
+                continue  
+
+            user = users.get(peer.user_id)  
+            if not user:  
+                continue  
+
+            if await is_target_member(  
+                client,  
+                target_entity,  
+                user  
+            ):  
+                members += 1  
+                if getattr(participant, "muted", False):  
+                    muted += 1  
+                else:  
+                    allowed += 1  
+
+        await message.answer(  
+            "🎙 <b>LIVE STATUS</b>\n\n"  
+            f"🎯 Target Channel:\n{target_row['title']}\n\n"  
+            f"📺 Live Channel:\n{live_row['title']}\n\n"  
+            f"👥 Target Members in Live: {members}\n"  
+            f"🔇 Muted: {muted}\n"  
+            f"🎤 Allowed: {allowed}\n\n"  
+            "🟢 Monitor: ON",  
+            parse_mode="HTML",  
+            reply_markup=main_keyboard()  
+        )  
+
+    except Exception as e:  
+        logger.exception(e)  
+        await message.answer(f"❌ Status Error:\n\n{e}")
+
+=========================================================
+MAIN MENU CALLBACK
+=========================================================
+
+@router.callback_query(
+    F.data == "back"
+)
+async def back_handler(
+    call: CallbackQuery
+):
+    await call.answer()  
+    await call.message.answer(  
+        "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\nControl Panel:",  
+        parse_mode="HTML",  
+        reply_markup=main_menu()  
+    )
+
+=========================================================
+HEALTH SERVER FOR RENDER / UPTIMEROBOT
+=========================================================
+
+async def health_handler(request):
+    return web.json_response({  
+        "status": "online",  
+        "service": "Telegram Auto Speaker",  
+        "time": int(time.time())  
+    })
+
+async def start_health_server():
+    app = web.Application()  
+    app.router.add_get("/", health_handler)  
+    app.router.add_get("/health", health_handler)  
+
+    port = int(os.getenv("PORT", "10000"))  
+    runner = web.AppRunner(app)  
+    await runner.setup()  
+
+    site = web.TCPSite(runner, "0.0.0.0", port)  
+    await site.start()  
+    logger.info("Health server running on port %s", port)
+
+=========================================================
+MAIN
+=========================================================
 
 async def main():
-
-    global monitor_task
-
-    logger.info(
-        "Starting Auto Speaker Manager..."
-    )
-
-    await health_server()
-
-    monitor_task = asyncio.create_task(
-        auto_monitor()
-    )
-
-    try:
-
-        await dp.start_polling(
-            bot
-        )
-
-    finally:
-
-        if monitor_task:
-
-            monitor_task.cancel()
-
-            try:
-                await monitor_task
-            except asyncio.CancelledError:
-                pass
-
-        for client in clients.values():
-
-            try:
-
-                if client.is_connected():
-                    await client.disconnect()
-
-            except Exception:
-                pass
-
-        await bot.session.close()
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
+    logger.info("Telegram Auto Speaker Starting...")  
+    await start_health_server()  
+    asyncio.create_task(auto_monitor())  
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-
-    if len(sys.argv) >= 2:
-
-        command = sys.argv[1]
-
-        if command == "--login":
-
-            if len(sys.argv) < 3:
-
-                print(
-                    "Usage: python main.py --login YOUR_BOT_USER_ID"
-                )
-
-                sys.exit(1)
-
-            try:
-
-                login_user_id = int(
-                    sys.argv[2]
-                )
-
-            except ValueError:
-
-                print(
-                    "User ID must be a number."
-                )
-
-                sys.exit(1)
-
-            asyncio.run(
-                login_account(
-                    login_user_id
-                )
-            )
-
-        else:
-
-            print(
-                "Unknown command."
-            )
-
-            print(
-                "Use:"
-            )
-
-            print(
-                "python main.py"
-            )
-
-            print(
-                "python main.py --login YOUR_BOT_USER_ID"
-            )
-
-    else:
-
-        asyncio.run(
-            main()
-        )
+    try:  
+        asyncio.run(main())  
+    except KeyboardInterrupt:  
+        logger.info("Bot stopped")
