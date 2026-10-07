@@ -119,10 +119,23 @@ def session_path(user_id):
 
 def get_client(user_id):
     if user_id not in clients:
+        path = session_path(user_id)
+        # যদি পুরানো ব্লকড সেশন ফাইল থাকে তা পরিষ্কার করে দেওয়া যাতে ফ্রেশ লগইন হয়
+        if os.path.exists(path + ".session"):
+            try:
+                os.remove(path + ".session")
+            except Exception:
+                pass
+
         clients[user_id] = TelegramClient(
-            session_path(user_id),
+            path,
             API_ID,
             API_HASH,
+            device_model="PC 64bit",
+            system_version="Windows 11",
+            app_version="4.8.1 x64",
+            lang_code="en",
+            system_lang_code="en-US",
             connection_retries=5,
             timeout=30
         )
@@ -279,6 +292,15 @@ async def connect_qr_callback(call: CallbackQuery, state: FSMContext):
     await state.clear()
     message = call.message
     user_id = message.chat.id
+    
+    # নতুন ফ্রেশ ক্লায়েন্ট তৈরি করার জন্য ডিকশনারি থেকে রিমুভ করা
+    if user_id in clients:
+        try:
+            await clients[user_id].disconnect()
+        except Exception:
+            pass
+        del clients[user_id]
+
     client = get_client(user_id)
 
     try:
@@ -377,6 +399,14 @@ async def wait_for_qr_login(user_id):
 @router.callback_query(F.data == "connect_phone")
 async def connect_phone_callback(call: CallbackQuery, state: FSMContext):
     await call.answer()
+    user_id = call.message.chat.id
+    if user_id in clients:
+        try:
+            await clients[user_id].disconnect()
+        except Exception:
+            pass
+        del clients[user_id]
+
     await state.set_state(PhoneLoginState.waiting_phone)
     await call.message.answer(
         "📱 <b>Phone Number দিয়ে লগইন</b>\n\n"
@@ -926,7 +956,7 @@ async def live_status_message(message):
             "🎙 <b>LIVE STATUS</b>\n\n"  
             f"🎯 Target Channel:\n{target_row['title']}\n\n"  
             f"📺 Live Channel:\n{live_row['title']}\n\n"  
-            f"👥 Target Members in Live: {members}\n"  
+            f"👥 Target Members in Live: {members}\n`"  
             f"🔇 Muted: {muted}\n"  
             f"🎤 Allowed: {allowed}\n\n"  
             "🟢 Monitor: ON",  
