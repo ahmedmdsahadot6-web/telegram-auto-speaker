@@ -123,9 +123,6 @@ def get_client(user_id):
             session_path(user_id),
             API_ID,
             API_HASH,
-            device_model="Desktop",
-            system_version="Windows 11",
-            app_version="4.8.1 x64",
             connection_retries=5,
             timeout=30
         )
@@ -168,7 +165,7 @@ def main_menu():
             [InlineKeyboardButton(text="🎯 Target Channel", callback_data="target")],
             [InlineKeyboardButton(text="📺 Live Stream Channel", callback_data="live")],
             [InlineKeyboardButton(text="📊 Live Status", callback_data="status")],
-            [InlineKeyboardButton(text="ℹ️️ Help", callback_data="help")]
+            [InlineKeyboardButton(text="ℹ Help", callback_data="help")]
         ]
     )
 
