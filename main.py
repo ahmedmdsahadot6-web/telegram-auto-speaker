@@ -1147,7 +1147,7 @@ def home():
     return "Telegram Auto Speaker & SMM Engine: ACTIVE 24/7"
 
 def ping_self():
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://reaction-bot-7d1u.onrender.com")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://telegram-auto-speaker-1.onrender.com")
     while True:
         try:
             time.sleep(280) # Ping every 4 mins 50 secs
