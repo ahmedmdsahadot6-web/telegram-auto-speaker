@@ -495,12 +495,12 @@ async def get_participants(client, call):
     users = {user.id: user for user in result.users}
     return result.participants, users
 
-async def is_target_member(client, target_entity, user):
+async def is_target_member(client, target_entity, user_id):
     try:
         participant = await client(
             functions.channels.GetParticipantRequest(
                 channel=target_entity,
-                participant=types.InputPeerUser(user_id=user.id, access_hash=user.access_hash)
+                participant=user_id
             )
         )
         member = participant.participant
@@ -508,7 +508,7 @@ async def is_target_member(client, target_entity, user):
             return False
         return True
     except Exception as e:
-        logger.warning("Membership check failed for %s: %s", user.id, e)
+        logger.warning("Membership check failed for %s: %s", user_id, e)
         return False
 
 async def allow_participant(client, call, user):
@@ -550,29 +550,26 @@ async def monitor_user(user_id):
             if not isinstance(peer, types.PeerUser):    
                 continue    
 
-            user = users.get(peer.user_id)    
-            if not user:
-                try:
-                    user = await client.get_entity(peer.user_id)
-                except Exception:
-                    continue
-
-            if not user:
+            target_user_id = peer.user_id
+            
+            # সরাসরি পিয়ার আইডি দিয়ে টার্গেট চ্যানেলের মেম্বারশিপ যাচাই করা হচ্ছে
+            is_member = await is_target_member(client, target_entity, target_user_id)
+            if not is_member:
                 continue
-
-            member = await is_target_member(client, target_entity, user)    
-            if not member:    
-                continue    
 
             muted = getattr(participant, "muted", False)    
             if not muted:    
                 continue    
 
             try:    
-                await allow_participant(client, call, user)    
+                user_entity = users.get(target_user_id)
+                if not user_entity:
+                    user_entity = await client.get_entity(target_user_id)
+
+                await allow_participant(client, call, user_entity)    
                 logger.info(    
                     "Target member allowed: %s | target=%s | live=%s",    
-                    user.id,    
+                    target_user_id,    
                     target_row["channel_username"],    
                     live_row["channel_username"]    
                 )    
@@ -660,17 +657,9 @@ async def live_status_message(message):
             if not isinstance(peer, types.PeerUser):    
                 continue    
 
-            user = users.get(peer.user_id)    
-            if not user:
-                try:
-                    user = await client.get_entity(peer.user_id)
-                except Exception:
-                    continue
+            target_user_id = peer.user_id
 
-            if not user:
-                continue
-
-            if await is_target_member(client, target_entity, user):    
+            if await is_target_member(client, target_entity, target_user_id):    
                 members += 1    
                 if getattr(participant, "muted", False):    
                     muted += 1    
