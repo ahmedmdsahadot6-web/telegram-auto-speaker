@@ -339,7 +339,7 @@ async def target_start(message, state):
     else:    
         await message.answer(    
             "🎯 <b>Target Channel</b>\n\n"    
-            "যে Channel-এর সদস্যদের Live-এ Allow to Speak করতে চান সেই Channel-এর username পাঠান。\n\n"    
+            "যে Channel-এর সদস্যদের Live-এ Allow to Speak করতে চান সেই Channel-এর username পাঠান।\n\n"    
             "উদাহরণ:\n"    
             "<code>@MyTargetChannel</code>",    
             parse_mode="HTML"    
@@ -491,7 +491,7 @@ async def get_active_call(client, channel_username):
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
-    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=100, offset=0))
+    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=100))
     users = {user.id: user for user in result.users}
     return result.participants, users
 
