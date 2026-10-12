@@ -1116,7 +1116,7 @@ async def live_status_message(message: Message):
             f"🎤 Unmuted: {allowed}\n"
             f"❔ যাচাই হয়নি/অন্য সদস্য: {unchecked}\n\n"
             "🟢 Monitor: ON\n"
-            "ℹ️ এই ফলাফল Telegram API-তে পাওয়া অংশগ্রহণকারীদের ভিত্তিতে।",
+            "",
             parse_mode="HTML",
             reply_markup=main_keyboard(),
         )
