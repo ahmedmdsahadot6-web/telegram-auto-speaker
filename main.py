@@ -4,9 +4,12 @@ import asyncio
 import logging
 import sqlite3
 from contextlib import suppress
+from threading import Thread
 
 from dotenv import load_dotenv
-from aiohttp import web
+from aiohttp import web as aiohttp_web
+from flask import Flask
+import requests
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -381,7 +384,6 @@ async def connect_telegram_menu(
     message: Message,
     state: FSMContext,
 ):
-    # Private bot chat ID is the Telegram user's ID.
     user_id = message.chat.id
 
     if is_connected_user(user_id):
@@ -437,7 +439,7 @@ async def process_string_session(
 
     if len(session_string) < 30:
         await message.answer(
-            "❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো।"
+            "❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো。"
         )
         return
 
@@ -492,7 +494,6 @@ async def process_string_session(
 
         await state.clear()
 
-        # Remove the message containing the session when possible.
         with suppress(Exception):
             await message.delete()
 
@@ -618,7 +619,7 @@ async def live_start(
     else:
         await message.answer(
             "📺 <b>Live Stream Channel</b>\n\n"
-            "যে public চ্যানেলে তুমি লাইভ করো তার username পাঠাও।\n\n"
+            "যে public চ্যানেলে তুমি লাইভ করো তার username পাঠাও。\n\n"
             "উদাহরণ: <code>@MyLiveChannel</code>",
             parse_mode="HTML",
         )
@@ -919,7 +920,6 @@ async def monitor_user(user_id):
                 ):
                     continue
 
-                # Already unmuted: no request needed.
                 if not getattr(participant, "muted", False):
                     continue
 
@@ -1137,37 +1137,37 @@ async def live_status_message(message: Message):
 
 
 # =========================================================
-# RENDER HEALTH CHECK
+# FLASK WEB SERVER & KEEP-ALIVE (FOR RENDER & UPTIMEROBOT)
 # =========================================================
 
-async def health_handler(request):
-    return web.json_response({
-        "status": "online",
-        "service": "Telegram Auto Speaker",
-        "time": int(time.time()),
-    })
+web_app = Flask(__name__)
 
+@web_app.route('/')
+def home():
+    return "Telegram Auto Speaker & SMM Engine: ACTIVE 24/7"
 
-async def start_health_server():
-    app = web.Application()
+def ping_self():
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://reaction-bot-7d1u.onrender.com")
+    while True:
+        try:
+            time.sleep(280) # Ping every 4 mins 50 secs
+            requests.get(render_url, timeout=10)
+            logger.info("📡 Keeping bot server active 24/7...")
+        except Exception as e:
+            logger.warning(f"Self Ping Warning: {e}")
 
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
+def keep_alive():
+    t_web = Thread(target=run_web)
+    t_web.daemon = True
+    t_web.start()
 
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT,
-    )
-
-    await site.start()
-
-    logger.info("Health server running on port %s", PORT)
-
-    return runner
+    t_ping = Thread(target=ping_self)
+    t_ping.daemon = True
+    t_ping.start()
 
 
 # =========================================================
@@ -1177,7 +1177,7 @@ async def start_health_server():
 async def main():
     logger.info("Telegram Auto Speaker starting...")
 
-    health_runner = await start_health_server()
+    keep_alive()
     monitor_task = asyncio.create_task(auto_monitor())
 
     try:
@@ -1191,9 +1191,6 @@ async def main():
 
         for user_id in list(clients.keys()):
             await disconnect_client(user_id)
-
-        with suppress(Exception):
-            await health_runner.cleanup()
 
         await bot.session.close()
         db.close()
