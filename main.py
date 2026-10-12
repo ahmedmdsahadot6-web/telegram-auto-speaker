@@ -551,8 +551,14 @@ async def monitor_user(user_id):
                 continue    
 
             user = users.get(peer.user_id)    
-            if not user:    
-                continue    
+            if not user:
+                try:
+                    user = await client.get_entity(peer.user_id)
+                except Exception:
+                    continue
+
+            if not user:
+                continue
 
             member = await is_target_member(client, target_entity, user)    
             if not member:    
@@ -655,8 +661,14 @@ async def live_status_message(message):
                 continue    
 
             user = users.get(peer.user_id)    
-            if not user:    
-                continue    
+            if not user:
+                try:
+                    user = await client.get_entity(peer.user_id)
+                except Exception:
+                    continue
+
+            if not user:
+                continue
 
             if await is_target_member(client, target_entity, user):    
                 members += 1    
