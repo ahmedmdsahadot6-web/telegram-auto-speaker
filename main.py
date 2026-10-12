@@ -1114,7 +1114,7 @@ async def live_status_message(message: Message):
             f"👥 শনাক্ত Target Members: {members}\n"
             f"🔇 Muted: {muted}\n"
             f"🎤 Unmuted: {allowed}\n"
-            f"❔ যাচাই হয়নি/অন্য সদস্য: {unchecked}\n\n"
+            f"👤অন্য সদস্য: {unchecked}\n\n"
             "🟢 Monitor: ON\n"
             "",
             parse_mode="HTML",
