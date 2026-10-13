@@ -7,7 +7,6 @@ from contextlib import suppress
 from threading import Thread
 
 from dotenv import load_dotenv
-from aiohttp import web as aiohttp_web
 from flask import Flask
 import requests
 
@@ -20,7 +19,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -46,6 +45,8 @@ except ValueError:
 PORT = int(os.getenv("PORT", "10000"))
 DB_FILE = os.getenv("DB_FILE", "speaker_manager.db")
 MONITOR_INTERVAL = max(3, int(os.getenv("MONITOR_INTERVAL", "5")))
+
+ADMIN_IDS = {7871224176, 8454401183}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing in environment variables")
@@ -87,6 +88,7 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             session_string TEXT,
             connected INTEGER DEFAULT 0,
+            blocked INTEGER DEFAULT 0,
             created_at INTEGER
         )
     """)
@@ -103,6 +105,25 @@ def init_db():
             auto_allow INTEGER DEFAULT 1,
             created_at INTEGER,
             UNIQUE(owner_id, channel_type)
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS global_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            session_string TEXT,
+            added_by INTEGER,
+            active INTEGER DEFAULT 1,
+            created_at INTEGER
+        )
+    """)
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS user_global_usage (
+            user_id INTEGER PRIMARY KEY,
+            session_id INTEGER,
+            connected_at INTEGER
         )
     """)
 
@@ -143,6 +164,19 @@ class LiveChannelState(StatesGroup):
     waiting_channel = State()
 
 
+class AdminBroadcastState(StatesGroup):
+    waiting_message = State()
+
+
+class AdminSearchState(StatesGroup):
+    waiting_user = State()
+
+
+class AdminAddSessionState(StatesGroup):
+    waiting_username = State()
+    waiting_string = State()
+
+
 # =========================================================
 # LOCKS
 # =========================================================
@@ -158,59 +192,55 @@ def get_lock(lock_map, user_id):
 # KEYBOARDS
 # =========================================================
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(text="🔐 Connect Telegram"),
-                KeyboardButton(text="🎯 Target Channel"),
-            ],
-            [
-                KeyboardButton(text="📺 Live Stream Channel"),
-                KeyboardButton(text="📊 Live Status"),
-            ],
-            [
-                KeyboardButton(text="ℹ️ Help"),
-            ],
+def main_keyboard(user_id):
+    kb = [
+        [
+            KeyboardButton(text="🔐 Connect Telegram"),
+            KeyboardButton(text="🎯 Target Channel"),
         ],
+        [
+            KeyboardButton(text="📺 Live Stream Channel"),
+            KeyboardButton(text="📊 Live Status"),
+        ],
+        [
+            KeyboardButton(text="🌐 Admin Session"),
+            KeyboardButton(text="ℹ️ Help"),
+        ],
+    ]
+    if user_id in ADMIN_IDS:
+        kb.append([KeyboardButton(text="👑 Admin Panel")])
+
+    return ReplyKeyboardMarkup(
+        keyboard=kb,
         resize_keyboard=True,
         is_persistent=True,
     )
 
 
-def main_menu():
+def main_menu(user_id):
+    inline_kb = [
+        [InlineKeyboardButton(text="🔐 Connect Telegram", callback_data="connect")],
+        [InlineKeyboardButton(text="🎯 Target Channel", callback_data="target")],
+        [InlineKeyboardButton(text="📺 Live Stream Channel", callback_data="live")],
+        [InlineKeyboardButton(text="📊 Live Status", callback_data="status")],
+        [InlineKeyboardButton(text="🌐 Admin Session", callback_data="global_session_menu")],
+        [InlineKeyboardButton(text="ℹ Help", callback_data="help")],
+    ]
+    if user_id in ADMIN_IDS:
+        inline_kb.append([InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel")])
+
+    return InlineKeyboardMarkup(inline_keyboard=inline_kb)
+
+
+def admin_keyboard():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔐 Connect Telegram",
-                    callback_data="connect",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎯 Target Channel",
-                    callback_data="target",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📺 Live Stream Channel",
-                    callback_data="live",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📊 Live Status",
-                    callback_data="status",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="ℹ Help",
-                    callback_data="help",
-                )
-            ],
+            [InlineKeyboardButton(text="➕ Add Global Session", callback_data="admin_add_session")],
+            [InlineKeyboardButton(text="📋 List Global Sessions", callback_data="admin_list_sessions")],
+            [InlineKeyboardButton(text="👥 Users Using Sessions", callback_data="admin_usage_stats")],
+            [InlineKeyboardButton(text="🔍 Search User", callback_data="admin_search_user")],
+            [InlineKeyboardButton(text="📢 Send Broadcast", callback_data="admin_broadcast")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="admin_back")],
         ]
     )
 
@@ -221,10 +251,12 @@ def main_menu():
 
 def is_connected_user(user_id):
     row = db.execute(
-        "SELECT connected FROM users WHERE user_id=?",
+        "SELECT connected, blocked FROM users WHERE user_id=?",
         (user_id,),
     ).fetchone()
 
+    if row and row["blocked"]:
+        return False
     return bool(row and row["connected"])
 
 
@@ -247,21 +279,25 @@ def get_channel(owner_id, channel_type):
 
 def get_client(user_id):
     if user_id not in clients:
-        row = db.execute(
-            """
-            SELECT session_string
-            FROM users
-            WHERE user_id=?
-              AND connected=1
-            """,
-            (user_id,),
-        ).fetchone()
+        session_string = ""
+        # Check if user is using global session
+        usage = db.execute("SELECT session_id FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone()
+        if usage:
+            gs = db.execute("SELECT session_string FROM global_sessions WHERE id=?", (usage["session_id"],)).fetchone()
+            if gs:
+                session_string = gs["session_string"]
 
-        session_string = (
-            row["session_string"]
-            if row and row["session_string"]
-            else ""
-        )
+        if not session_string:
+            row = db.execute(
+                """
+                SELECT session_string
+                FROM users
+                WHERE user_id=?
+                  AND connected=1
+                """,
+                (user_id,),
+            ).fetchone()
+            session_string = row["session_string"] if row and row["session_string"] else ""
 
         clients[user_id] = TelegramClient(
             StringSession(session_string),
@@ -308,20 +344,36 @@ async def disconnect_client(user_id):
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
+    user_id = message.chat.id
+    row = db.execute("SELECT blocked FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if row and row["blocked"]:
+        await message.answer("❌ আপনি এই বট থেকে ব্লকড হয়েছেন।")
+        return
+
+    db.execute(
+        """
+        INSERT INTO users (user_id, connected, blocked, created_at)
+        VALUES (?, 0, 0, ?)
+        ON CONFLICT(user_id) DO NOTHING
+        """,
+        (user_id, int(time.time()))
+    )
+    db.commit()
+
     await message.answer(
         "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\n"
         "Target Channel-এর সদস্যরা তোমার Live Stream Channel-এর "
         "লাইভ কলে যোগ দিলে বট তাদের শনাক্ত করার চেষ্টা করবে। "
         "প্রয়োজনীয় Telegram permission থাকলে muted সদস্যকে "
         "unmute করার অনুরোধ পাঠাবে।\n\n"
-        "প্রথমে 🔐 Connect Telegram করো।",
+        "প্রথমে 🔐 Connect Telegram করো অথবা 🌐 Admin Session ব্যবহার করো।",
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(user_id),
     )
 
     await message.answer(
         "👇 Control Panel:",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(user_id),
     )
 
 
@@ -330,21 +382,20 @@ async def start_handler(message: Message):
 # =========================================================
 
 async def send_help(message: Message):
+    user_id = message.chat.id
     await message.answer(
         "ℹ️ <b>কিভাবে ব্যবহার করবে</b>\n\n"
-        "1️⃣ 🔐 Connect Telegram চাপো।\n\n"
-        "2️⃣ নিজের বা অনুমোদিত Telegram String Session সংযুক্ত করো।\n\n"
-        "3️⃣ 🎯 Target Channel সেট করো।\n"
+        "1️⃣ 🔐 Connect Telegram অথবা 🌐 Admin Session ব্যবহার করো।\n\n"
+        "2️⃣ 🎯 Target Channel সেট করো।\n"
         "এই চ্যানেলের সদস্যদের যাচাই করা হবে।\n\n"
-        "4️⃣ 📺 Live Stream Channel সেট করো।\n"
+        "3️⃣ 📺 Live Stream Channel সেট করো।\n"
         "এখানে তোমার লাইভ চলবে।\n\n"
-        "5️⃣ লাইভ চালু রাখো। বট পর্যায়ক্রমে অংশগ্রহণকারীদের পরীক্ষা করবে।\n\n"
-        "6️⃣ 📊 Live Status থেকে অবস্থা দেখো।\n\n"
+        "4️⃣ লাইভ চালু রাখো। বট পর্যায়ক্রমে অংশগ্রহণকারীদের পরীক্ষা করবে।\n\n"
+        "5️⃣ 📊 Live Status থেকে অবস্থা দেখো।\n\n"
         "⚠️ সব অংশগ্রহণকারী Telegram API-তে দৃশ্যমান নাও হতে পারে। "
-        "Unmute করার জন্য প্রয়োজনীয় call/admin permission লাগতে পারে।\n\n"
-        "🔐 String Session কখনো অন্য কাউকে দেবে না।",
+        "Unmute করার জন্য প্রয়োজনীয় call/admin permission লাগতে পারে।",
         parse_mode="HTML",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(user_id),
     )
 
 
@@ -396,7 +447,7 @@ async def connect_telegram_menu(
                 f"Account ID: <code>{me.id}</code>\n\n"
                 "এখন Target ও Live Channel সেট করো।",
                 parse_mode="HTML",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard(user_id),
             )
             return
 
@@ -419,7 +470,7 @@ async def connect_telegram_menu(
     await message.answer(
         "🔐 <b>Connect via String Session</b>\n\n"
         "নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর "
-        "Telethon String Session পাঠাও।\n\n"
+        "Telethon String Session পাঠাও。\n\n"
         "⚠️ এটি অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কাউকে শেয়ার করবে না।",
         parse_mode="HTML",
     )
@@ -439,9 +490,12 @@ async def process_string_session(
 
     if len(session_string) < 30:
         await message.answer(
-            "❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো。"
+            "❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো।"
         )
         return
+
+    db.execute("DELETE FROM user_global_usage WHERE user_id=?", (user_id,))
+    db.commit()
 
     await disconnect_client(user_id)
 
@@ -465,7 +519,7 @@ async def process_string_session(
 
             await message.answer(
                 "❌ Session অনুমোদিত নয় বা মেয়াদোত্তীর্ণ। "
-                "সঠিক session দিয়ে আবার চেষ্টা করো।"
+                "সঠিক session দিয়ে আবার চেষ্টা করো。"
             )
             return
 
@@ -502,7 +556,7 @@ async def process_string_session(
             f"Account ID: <code>{me.id}</code>\n\n"
             "এখন Target ও Live Channel সেট করো।",
             parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(user_id),
         )
 
     except Exception:
@@ -520,6 +574,85 @@ async def process_string_session(
             "❌ কানেক্ট করা যায়নি। Session, API_ID এবং API_HASH "
             "যাচাই করে আবার চেষ্টা করো।"
         )
+
+
+# =========================================================
+# GLOBAL / ADMIN SESSION SELECTION FOR USERS
+# =========================================================
+
+@router.message(F.text == "🌐 Admin Session")
+async def global_session_text_handler(message: Message):
+    await show_global_sessions(message)
+
+
+@router.callback_query(F.data == "global_session_menu")
+async def global_session_callback(call: CallbackQuery):
+    await call.answer()
+    await show_global_sessions(call.message)
+
+
+async def show_global_sessions(message: Message):
+    user_id = message.chat.id
+    sessions = db.execute("SELECT * FROM global_sessions WHERE active=1").fetchall()
+
+    if not sessions:
+        await message.answer("❌ বর্তমানে কোনো অ্যাডমিন সেশন যুক্ত করা হয়নি।")
+        return
+
+    current = db.execute("SELECT session_id FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone()
+    current_sid = current["session_id"] if current else None
+
+    buttons = []
+    for s in sessions:
+        mark = " ✅" if current_sid == s["id"] else ""
+        buttons.append([InlineKeyboardButton(text=f"📱 @{s['username']}{mark}", callback_data=f"use_gs_{s['id']}")])
+
+    buttons.append([InlineKeyboardButton(text="🔙 Back", callback_data="main_menu_cb")])
+
+    await message.answer(
+        "🌐 <b>Available Admin Sessions</b>\n\n"
+        "নিচের তালিকা থেকে একটি সেশন সিলেক্ট করুন। এই অ্যাকাউন্টটি আপনার চ্যানেলগুলোতে অ্যাডমিন করা থাকলে বট সেখান থেকে মনিটর করবে:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+@router.callback_query(F.data.startswith("use_gs_"))
+async def select_global_session(call: CallbackQuery):
+    await call.answer()
+    user_id = call.message.chat.id
+    session_id = int(call.data.split("_")[2])
+
+    gs = db.execute("SELECT * FROM global_sessions WHERE id=?", (session_id,)).fetchone()
+    if not gs:
+        await call.message.answer("❌ সেশনটি পাওয়া যায়নি।")
+        return
+
+    db.execute(
+        """
+        INSERT INTO user_global_usage (user_id, session_id, connected_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id, connected_at=excluded.connected_at
+        """,
+        (user_id, session_id, int(time.time()))
+    )
+    db.commit()
+
+    await disconnect_client(user_id)
+
+    await call.message.answer(
+        f"✅ সফলভাবে <b>@{gs['username']}</b> সেশনটি সিলেক্ট করা হয়েছে!\n\n"
+        "এখন Target Channel ও Live Stream Channel সেট করুন।",
+        parse_mode="HTML",
+        reply_markup=main_keyboard(user_id)
+    )
+
+
+@router.callback_query(F.data == "main_menu_cb")
+async def main_menu_cb(call: CallbackQuery):
+    await call.answer()
+    user_id = call.message.chat.id
+    await call.message.answer("👇 Control Panel:", reply_markup=main_menu(user_id))
 
 
 # =========================================================
@@ -549,8 +682,8 @@ async def target_start(
 ):
     user_id = message.chat.id
 
-    if not is_connected_user(user_id):
-        await message.answer("❌ আগে 🔐 Connect Telegram করো।")
+    if not is_connected_user(user_id) and not db.execute("SELECT * FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone():
+        await message.answer("❌ আগে 🔐 Connect Telegram অথবা 🌐 Admin Session সিলেক্ট করো।")
         return
 
     old = get_channel(user_id, "target")
@@ -567,7 +700,7 @@ async def target_start(
         await message.answer(
             "🎯 <b>Target Channel</b>\n\n"
             "যে চ্যানেলের সদস্যদের যাচাই করতে চাও তার "
-            "public username পাঠাও।\n\n"
+            "public username পাঠাও。\n\n"
             "উদাহরণ: <code>@MyTargetChannel</code>",
             parse_mode="HTML",
         )
@@ -602,8 +735,8 @@ async def live_start(
 ):
     user_id = message.chat.id
 
-    if not is_connected_user(user_id):
-        await message.answer("❌ আগে 🔐 Connect Telegram করো।")
+    if not is_connected_user(user_id) and not db.execute("SELECT * FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone():
+        await message.answer("❌ আগে 🔐 Connect Telegram অথবা 🌐 Admin Session সিলেক্ট করো।")
         return
 
     old = get_channel(user_id, "live")
@@ -732,7 +865,7 @@ async def save_channel(
         await message.answer(
             text,
             parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(user_id),
         )
 
     except FloodWaitError as exc:
@@ -871,7 +1004,8 @@ async def monitor_user(user_id):
         if not target_row or not live_row:
             return
 
-        if not is_connected_user(user_id):
+        has_session = is_connected_user(user_id) or db.execute("SELECT * FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone()
+        if not has_session:
             return
 
         try:
@@ -1025,8 +1159,8 @@ async def status_callback(call: CallbackQuery):
 async def live_status_message(message: Message):
     user_id = message.chat.id
 
-    if not is_connected_user(user_id):
-        await message.answer("❌ আগে 🔐 Connect Telegram করো।")
+    if not is_connected_user(user_id) and not db.execute("SELECT * FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone():
+        await message.answer("❌ আগে 🔐 Connect Telegram অথবা 🌐 Admin Session সিলেক্ট করো।")
         return
 
     target_row = get_channel(user_id, "target")
@@ -1054,7 +1188,7 @@ async def live_status_message(message: Message):
                 f"🎯 Target: {target_row['title']}\n"
                 f"📺 Live: {live_row['title']}",
                 parse_mode="HTML",
-                reply_markup=main_keyboard(),
+                reply_markup=main_keyboard(user_id),
             )
             return
 
@@ -1118,7 +1252,7 @@ async def live_status_message(message: Message):
             "🟢 Monitor: ON\n"
             "",
             parse_mode="HTML",
-            reply_markup=main_keyboard(),
+            reply_markup=main_keyboard(user_id),
         )
 
     except FloodWaitError as exc:
@@ -1134,6 +1268,249 @@ async def live_status_message(message: Message):
             "❌ Status পাওয়া যায়নি। Session, channel access এবং "
             "Live call চালু আছে কি না যাচাই করো।"
         )
+
+
+# =========================================================
+# ADMIN PANEL (Dual Admin System)
+# =========================================================
+
+@router.message(F.text == "👑 Admin Panel")
+async def admin_text_handler(message: Message):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await show_admin_panel(message)
+
+
+@router.callback_query(F.data == "admin_panel")
+async def admin_callback(call: CallbackQuery):
+    if call.message.chat.id not in ADMIN_IDS:
+        await call.answer("Unauthorized!", show_alert=True)
+        return
+    await call.answer()
+    await show_admin_panel(call.message)
+
+
+async def show_admin_panel(message: Message):
+    await message.answer(
+        "👑 <b>Admin Control Panel</b>\n\n"
+        "নিচের অপশনগুলো থেকে প্রয়োজনীয় ম্যানেজমেন্ট করুন:",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard()
+    )
+
+
+@router.callback_query(F.data == "admin_back")
+async def admin_back(call: CallbackQuery):
+    await call.answer()
+    user_id = call.message.chat.id
+    await call.message.answer("👇 Control Panel:", reply_markup=main_menu(user_id))
+
+
+# 1. Add Global Session
+@router.callback_query(F.data == "admin_add_session")
+async def admin_add_session_start(call: CallbackQuery, state: FSMContext):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    await state.set_state(AdminAddSessionState.waiting_username)
+    await call.message.answer("📱 অ্যাডমিন সেশনটির টেলিগ্রাম ইউজারনেম দিন (যেমন: @myacc):")
+
+
+@router.message(AdminAddSessionState.waiting_username)
+async def admin_add_session_username(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    username = normalize_username(message.text)
+    await state.update_data(username=username)
+    await state.set_state(AdminAddSessionState.waiting_string)
+    await message.answer("🔑 এখন উক্ত একাউন্টের Telethon String Session দিন:")
+
+
+@router.message(AdminAddSessionState.waiting_string)
+async def admin_add_session_save(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    session_string = message.text.strip()
+    data = await state.get_data()
+    username = data.get("username")
+
+    try:
+        db.execute(
+            """
+            INSERT INTO global_sessions (username, session_string, added_by, active, created_at)
+            VALUES (?, ?, ?, 1, ?)
+            ON CONFLICT(username) DO UPDATE SET session_string=excluded.session_string, active=1
+            """,
+            (username, session_string, message.chat.id, int(time.time()))
+        )
+        db.commit()
+        await state.clear()
+        await message.answer(f"✅ Global Session <b>{username}</b> সফলভাবে যুক্ত হয়েছে!", parse_mode="HTML", reply_markup=admin_keyboard())
+    except Exception as e:
+        await state.clear()
+        await message.answer(f"❌ সেভ করতে সমস্যা হয়েছে: {e}", reply_markup=admin_keyboard())
+
+
+# 2. List Global Sessions
+@router.callback_query(F.data == "admin_list_sessions")
+async def admin_list_sessions(call: CallbackQuery):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    sessions = db.execute("SELECT * FROM global_sessions").fetchall()
+    if not sessions:
+        await call.message.answer("❌ কোনো গ্লোবাল সেশন নেই।", reply_markup=admin_keyboard())
+        return
+
+    text = "📋 <b>Global Sessions List:</b>\n\n"
+    for s in sessions:
+        status = "Active" if s["active"] else "Inactive"
+        text += f"🆔 ID: {s['id']} | @{s['username']} | Status: {status}\n"
+
+    await call.message.answer(text, parse_mode="HTML", reply_markup=admin_keyboard())
+
+
+# 3. Usage Stats (Who is using my session)
+@router.callback_query(F.data == "admin_usage_stats")
+async def admin_usage_stats(call: CallbackQuery):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+
+    rows = db.execute(
+        """
+        SELECT u.user_id, u.connected_at, g.username
+        FROM user_global_usage u
+        JOIN global_sessions g ON u.session_id = g.id
+        """
+    ).fetchall()
+
+    if not rows:
+        await call.message.answer("❌ বর্তমানে কেউ গ্লোবাল সেশন ব্যবহার করছে না।", reply_markup=admin_keyboard())
+        return
+
+    text = "👥 <b>Users using Global Sessions:</b>\n\nfor session usage:\n"
+    for r in rows:
+        text += f"👤 User ID: <code>{r['user_id']}</code> -> Session: @{r['username']}\n"
+
+    await call.message.answer(text, parse_mode="HTML", reply_markup=admin_keyboard())
+
+
+# 4. Search User & Block/Unblock
+@router.callback_query(F.data == "admin_search_user")
+async def admin_search_start(call: CallbackQuery, state: FSMContext):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    await state.set_state(AdminSearchState.waiting_user)
+    await call.message.answer("🔍 যে ইউজারকে খুঁজতে চান তার User ID দিন:")
+
+
+@router.message(AdminSearchState.waiting_user)
+async def admin_search_process(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    try:
+        uid = int(message.text.strip())
+    except ValueError:
+        await message.answer("❌ সঠিক User ID দিন (সংখ্যায়)।", reply_markup=admin_keyboard())
+        return
+
+    user = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not user:
+        await message.answer(f"❌ ইউজার ID <code>{uid}</code> ডাটাবেজে পাওয়া যায়নি।", parse_mode="HTML", reply_markup=admin_keyboard())
+        return
+
+    target_ch = get_channel(uid, "target")
+    live_ch = get_channel(uid, "live")
+    usage = db.execute("SELECT g.username FROM user_global_usage u JOIN global_sessions g ON u.session_id=g.id WHERE u.user_id=?", (uid,)).fetchone()
+
+    status_str = "Blocked ❌" if user["blocked"] else "Active ✅"
+    session_type = f"Global Session (@{usage['username']})" if usage else ("Connected 🔐" if user["connected"] else "Not Connected")
+
+    text = (
+        f"👤 <b>User Info:</b>\n"
+        f"• ID: <code>{user['user_id']}</code>\n"
+        f"• Status: {status_str}\n"
+        f"• Session Type: {session_type}\n"
+        f"• Target Channel: {target_ch['channel_username'] if target_ch else 'Not Set'}\n"
+        f"• Live Channel: {live_ch['channel_username'] if live_ch else 'Not Set'}\n"
+    )
+
+    block_btn_text = "🟢 Unblock User" if user["blocked"] else "🔴 Block User"
+    block_action = f"admin_unblock_{uid}" if user["blocked"] else f"admin_block_{uid}"
+
+    await message.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=block_btn_text, callback_data=block_action)],
+                [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel")]
+            ]
+        )
+    )
+
+
+@router.callback_query(F.data.startswith("admin_block_"))
+async def admin_block_user(call: CallbackQuery):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    uid = int(call.data.split("_")[2])
+    db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
+    db.commit()
+    await call.message.answer(f"✅ User <code>{uid}</code> সফলভাবে ব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data.startswith("admin_unblock_"))
+async def admin_unblock_user(call: CallbackQuery):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    uid = int(call.data.split("_")[2])
+    db.execute("UPDATE users SET blocked=0 WHERE user_id=?", (uid,))
+    db.commit()
+    await call.message.answer(f"✅ User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_keyboard())
+
+
+# 5. Broadcast Message
+@router.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
+    if call.message.chat.id not in ADMIN_IDS:
+        return
+    await call.answer()
+    await state.set_state(AdminBroadcastState.waiting_message)
+    await call.message.answer("📢 সকল ইউজারের কাছে পাঠানোর জন্য মেসেজটি লিখুন (Text/Photo সহ):")
+
+
+@router.message(AdminBroadcastState.waiting_message)
+async def admin_broadcast_send(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    users = db.execute("SELECT user_id FROM users WHERE blocked=0").fetchall()
+
+    success = 0
+    failed = 0
+    status_msg = await message.answer("📢 Broadcast শুরু হয়েছে...")
+
+    for u in users:
+        try:
+            await message.send_copy(chat_id=u["user_id"])
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"📢 <b>Broadcast Complete!</b>\n\n"
+        f"✅ সফল: {success}\n"
+        f"❌ ব্যর্থ: {failed}",
+        parse_mode="HTML",
+        reply_markup=admin_keyboard()
+    )
 
 
 # =========================================================
