@@ -217,6 +217,18 @@ def main_keyboard(user_id):
     )
 
 
+def admin_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Add Global Session"), KeyboardButton(text="📋 List Sessions")],
+            [KeyboardButton(text="👥 Usage Stats"), KeyboardButton(text="🔍 Search User")],
+            [KeyboardButton(text="📢 Broadcast"), KeyboardButton(text="🔙 Main Menu")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def main_menu(user_id):
     inline_kb = [
         [InlineKeyboardButton(text="🔐 Connect Telegram", callback_data="connect")],
@@ -280,7 +292,6 @@ def get_channel(owner_id, channel_type):
 def get_client(user_id):
     if user_id not in clients:
         session_string = ""
-        # Check if user is using global session
         usage = db.execute("SELECT session_id FROM user_global_usage WHERE user_id=?", (user_id,)).fetchone()
         if usage:
             gs = db.execute("SELECT session_string FROM global_sessions WHERE id=?", (usage["session_id"],)).fetchone()
@@ -343,7 +354,8 @@ async def disconnect_client(user_id):
 # =========================================================
 
 @router.message(CommandStart())
-async def start_handler(message: Message):
+async def start_handler(message: Message, state: FSMContext):
+    await state.clear()
     user_id = message.chat.id
     row = db.execute("SELECT blocked FROM users WHERE user_id=?", (user_id,)).fetchone()
     if row and row["blocked"]:
@@ -435,6 +447,7 @@ async def connect_telegram_menu(
     message: Message,
     state: FSMContext,
 ):
+    await state.clear()
     user_id = message.chat.id
 
     if is_connected_user(user_id):
@@ -471,7 +484,7 @@ async def connect_telegram_menu(
         "🔐 <b>Connect via String Session</b>\n\n"
         "নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর "
         "Telethon String Session পাঠাও。\n\n"
-        "⚠️ এটি অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কাউকে শেয়ার করবে না।",
+        "⚠️ এটি অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কাউকে শেয়ার করবে না。",
         parse_mode="HTML",
     )
 
@@ -481,8 +494,8 @@ async def process_string_session(
     message: Message,
     state: FSMContext,
 ):
-    if not message.text:
-        await message.answer("❌ String Session টেক্সট হিসেবে পাঠাও।")
+    if not message.text or message.text.startswith(("🔐", "🎯", "📺", "📊", "🌐", "ℹ️", "👑")):
+        await state.clear()
         return
 
     session_string = message.text.strip()
@@ -581,12 +594,14 @@ async def process_string_session(
 # =========================================================
 
 @router.message(F.text == "🌐 Admin Session")
-async def global_session_text_handler(message: Message):
+async def global_session_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     await show_global_sessions(message)
 
 
 @router.callback_query(F.data == "global_session_menu")
-async def global_session_callback(call: CallbackQuery):
+async def global_session_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.answer()
     await show_global_sessions(call.message)
 
@@ -649,7 +664,8 @@ async def select_global_session(call: CallbackQuery):
 
 
 @router.callback_query(F.data == "main_menu_cb")
-async def main_menu_cb(call: CallbackQuery):
+async def main_menu_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.answer()
     user_id = call.message.chat.id
     await call.message.answer("👇 Control Panel:", reply_markup=main_menu(user_id))
@@ -664,6 +680,7 @@ async def target_text_handler(
     message: Message,
     state: FSMContext,
 ):
+    await state.clear()
     await target_start(message, state)
 
 
@@ -672,6 +689,7 @@ async def target_callback(
     call: CallbackQuery,
     state: FSMContext,
 ):
+    await state.clear()
     await call.answer()
     await target_start(call.message, state)
 
@@ -717,6 +735,7 @@ async def live_text_handler(
     message: Message,
     state: FSMContext,
 ):
+    await state.clear()
     await live_start(message, state)
 
 
@@ -725,6 +744,7 @@ async def live_callback(
     call: CallbackQuery,
     state: FSMContext,
 ):
+    await state.clear()
     await call.answer()
     await live_start(call.message, state)
 
@@ -793,6 +813,10 @@ async def save_channel(
     state: FSMContext,
     channel_type: str,
 ):
+    if message.text and message.text.startswith(("🔐", "🎯", "📺", "📊", "🌐", "ℹ️", "👑")):
+        await state.clear()
+        return
+
     user_id = message.chat.id
     username = normalize_username(message.text)
 
@@ -983,6 +1007,7 @@ async def allow_participant(client, call, user):
             call=input_call,
             participant=input_user,
             muted=False,
+            raise_hand=False,
         )
     )
 
@@ -1146,12 +1171,14 @@ async def auto_monitor():
 # =========================================================
 
 @router.message(F.text == "📊 Live Status")
-async def status_text_handler(message: Message):
+async def status_text_handler(message: Message, state: FSMContext):
+    await state.clear()
     await live_status_message(message)
 
 
 @router.callback_query(F.data == "status")
-async def status_callback(call: CallbackQuery):
+async def status_callback(call: CallbackQuery, state: FSMContext):
+    await state.clear()
     await call.answer()
     await live_status_message(call.message)
 
@@ -1275,17 +1302,19 @@ async def live_status_message(message: Message):
 # =========================================================
 
 @router.message(F.text == "👑 Admin Panel")
-async def admin_text_handler(message: Message):
+async def admin_text_handler(message: Message, state: FSMContext):
     if message.chat.id not in ADMIN_IDS:
         return
+    await state.clear()
     await show_admin_panel(message)
 
 
 @router.callback_query(F.data == "admin_panel")
-async def admin_callback(call: CallbackQuery):
+async def admin_callback(call: CallbackQuery, state: FSMContext):
     if call.message.chat.id not in ADMIN_IDS:
         await call.answer("Unauthorized!", show_alert=True)
         return
+    await state.clear()
     await call.answer()
     await show_admin_panel(call.message)
 
@@ -1295,18 +1324,85 @@ async def show_admin_panel(message: Message):
         "👑 <b>Admin Control Panel</b>\n\n"
         "নিচের অপশনগুলো থেকে প্রয়োজনীয় ম্যানেজমেন্ট করুন:",
         parse_mode="HTML",
-        reply_markup=admin_keyboard()
+        reply_markup=admin_reply_keyboard()
     )
+    await message.answer("👇 Admin Actions:", reply_markup=admin_keyboard())
 
 
+@router.message(F.text == "🔙 Main Menu")
 @router.callback_query(F.data == "admin_back")
-async def admin_back(call: CallbackQuery):
-    await call.answer()
-    user_id = call.message.chat.id
-    await call.message.answer("👇 Control Panel:", reply_markup=main_menu(user_id))
+async def admin_back(event, state: FSMContext = None):
+    if state:
+        await state.clear()
+    user_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
+    msg = event if isinstance(event, Message) else event.message
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+    await msg.answer("👇 Control Panel:", reply_markup=main_keyboard(user_id))
+    await msg.answer("Main Menu:", reply_markup=main_menu(user_id))
 
 
-# 1. Add Global Session
+# Text Handlers for Admin Reply Keyboard
+@router.message(F.text == "➕ Add Global Session")
+async def admin_add_session_text(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminAddSessionState.waiting_username)
+    await message.answer("📱 অ্যাডমিন সেশনটির টেলিগ্রাম ইউজারনেম দিন (যেমন: @myacc):")
+
+
+@router.message(F.text == "📋 List Sessions")
+async def admin_list_sessions_text(message: Message):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    sessions = db.execute("SELECT * FROM global_sessions").fetchall()
+    if not sessions:
+        await message.answer("❌ কোনো গ্লোবাল সেশন নেই।", reply_markup=admin_reply_keyboard())
+        return
+    text = "📋 <b>Global Sessions List:</b>\n\n"
+    for s in sessions:
+        status = "Active" if s["active"] else "Inactive"
+        text += f"🆔 ID: {s['id']} | @{s['username']} | Status: {status}\n"
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_reply_keyboard())
+
+
+@router.message(F.text == "👥 Usage Stats")
+async def admin_usage_stats_text(message: Message):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    rows = db.execute(
+        """
+        SELECT u.user_id, u.connected_at, g.username
+        FROM user_global_usage u
+        JOIN global_sessions g ON u.session_id = g.id
+        """
+    ).fetchall()
+    if not rows:
+        await message.answer("❌ বর্তমানে কেউ গ্লোবাল সেশন ব্যবহার করছে না।", reply_markup=admin_reply_keyboard())
+        return
+    text = "👥 <b>Users using Global Sessions:</b>\n\n"
+    for r in rows:
+        text += f"👤 User ID: <code>{r['user_id']}</code> -> Session: @{r['username']}\n"
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_reply_keyboard())
+
+
+@router.message(F.text == "🔍 Search User")
+async def admin_search_text(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminSearchState.waiting_user)
+    await message.answer("🔍 যে ইউজারকে খুঁজতে চান তার User ID দিন:")
+
+
+@router.message(F.text == "📢 Broadcast")
+async def admin_broadcast_text(message: Message, state: FSMContext):
+    if message.chat.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminBroadcastState.waiting_message)
+    await message.answer("📢 সকল ইউজারের কাছে পাঠানোর জন্য মেসেজটি লিখুন (Text/Photo সহ):")
+
+
+# 1. Add Global Session (Callback)
 @router.callback_query(F.data == "admin_add_session")
 async def admin_add_session_start(call: CallbackQuery, state: FSMContext):
     if call.message.chat.id not in ADMIN_IDS:
@@ -1345,13 +1441,13 @@ async def admin_add_session_save(message: Message, state: FSMContext):
         )
         db.commit()
         await state.clear()
-        await message.answer(f"✅ Global Session <b>{username}</b> সফলভাবে যুক্ত হয়েছে!", parse_mode="HTML", reply_markup=admin_keyboard())
+        await message.answer(f"✅ Global Session <b>{username}</b> সফলভাবে যুক্ত হয়েছে!", parse_mode="HTML", reply_markup=admin_reply_keyboard())
     except Exception as e:
         await state.clear()
-        await message.answer(f"❌ সেভ করতে সমস্যা হয়েছে: {e}", reply_markup=admin_keyboard())
+        await message.answer(f"❌ সেভ করতে সমস্যা হয়েছে: {e}", reply_markup=admin_reply_keyboard())
 
 
-# 2. List Global Sessions
+# 2. List Global Sessions (Callback)
 @router.callback_query(F.data == "admin_list_sessions")
 async def admin_list_sessions(call: CallbackQuery):
     if call.message.chat.id not in ADMIN_IDS:
@@ -1370,7 +1466,7 @@ async def admin_list_sessions(call: CallbackQuery):
     await call.message.answer(text, parse_mode="HTML", reply_markup=admin_keyboard())
 
 
-# 3. Usage Stats (Who is using my session)
+# 3. Usage Stats (Callback)
 @router.callback_query(F.data == "admin_usage_stats")
 async def admin_usage_stats(call: CallbackQuery):
     if call.message.chat.id not in ADMIN_IDS:
@@ -1389,7 +1485,7 @@ async def admin_usage_stats(call: CallbackQuery):
         await call.message.answer("❌ বর্তমানে কেউ গ্লোবাল সেশন ব্যবহার করছে না।", reply_markup=admin_keyboard())
         return
 
-    text = "👥 <b>Users using Global Sessions:</b>\n\nfor session usage:\n"
+    text = "👥 <b>Users using Global Sessions:</b>\n\n"
     for r in rows:
         text += f"👤 User ID: <code>{r['user_id']}</code> -> Session: @{r['username']}\n"
 
@@ -1414,12 +1510,12 @@ async def admin_search_process(message: Message, state: FSMContext):
     try:
         uid = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ সঠিক User ID দিন (সংখ্যায়)।", reply_markup=admin_keyboard())
+        await message.answer("❌ সঠিক User ID দিন (সংখ্যায়)।", reply_markup=admin_reply_keyboard())
         return
 
     user = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
     if not user:
-        await message.answer(f"❌ ইউজার ID <code>{uid}</code> ডাটাবেজে পাওয়া যায়নি।", parse_mode="HTML", reply_markup=admin_keyboard())
+        await message.answer(f"❌ ইউজার ID <code>{uid}</code> ডাটাবেজে পাওয়া যায়নি।", parse_mode="HTML", reply_markup=admin_reply_keyboard())
         return
 
     target_ch = get_channel(uid, "target")
@@ -1461,7 +1557,7 @@ async def admin_block_user(call: CallbackQuery):
     uid = int(call.data.split("_")[2])
     db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
     db.commit()
-    await call.message.answer(f"✅ User <code>{uid}</code> সফলভাবে ব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_keyboard())
+    await call.message.answer(f"✅ User <code>{uid}</code> সফলভাবে ব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_reply_keyboard())
 
 
 @router.callback_query(F.data.startswith("admin_unblock_"))
@@ -1472,10 +1568,10 @@ async def admin_unblock_user(call: CallbackQuery):
     uid = int(call.data.split("_")[2])
     db.execute("UPDATE users SET blocked=0 WHERE user_id=?", (uid,))
     db.commit()
-    await call.message.answer(f"✅ User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_keyboard())
+    await call.message.answer(f"✅ User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_reply_keyboard())
 
 
-# 5. Broadcast Message
+# 5. Broadcast Message (Callback)
 @router.callback_query(F.data == "admin_broadcast")
 async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
     if call.message.chat.id not in ADMIN_IDS:
@@ -1509,7 +1605,7 @@ async def admin_broadcast_send(message: Message, state: FSMContext):
         f"✅ সফল: {success}\n"
         f"❌ ব্যর্থ: {failed}",
         parse_mode="HTML",
-        reply_markup=admin_keyboard()
+        reply_markup=admin_reply_keyboard()
     )
 
 
