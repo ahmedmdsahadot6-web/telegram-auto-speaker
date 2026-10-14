@@ -1490,7 +1490,7 @@ async def admin_add_session_start(call: CallbackQuery, state: FSMContext):
         return
     await call.answer()
     await state.set_state(AdminSessionState.waiting_username)
-    await call.message.answer("অ্যাকাউন্টের username দিন (যেমন @myaccount):")
+    await call.message.answer("অ্যাকাউন্টের username দিন যেমন (@myaccount):")
 
 @router.message(AdminSessionState.waiting_username)
 async def admin_add_session_username(message: Message, state: FSMContext):
