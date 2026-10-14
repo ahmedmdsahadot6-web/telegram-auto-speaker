@@ -892,16 +892,37 @@ async def save_live_channel(message: Message, state: FSMContext):
 
 async def save_channel(message: Message, state: FSMContext, channel_type: str):
     uid = message.chat.id
-    username = normalize_username(message.text)
+    raw_text = (message.text or "").strip()
+    username = normalize_username(raw_text)
     if not username or username == "@":
         await message.answer("❌ সঠিক Channel লিংক অথবা username দিন, যেমন @MyChannel")
         return
     try:
         client = await ensure_client(uid)
-        entity = await client.get_entity(username)
-        if not isinstance(entity, (types.Channel, types.Chat)):
-            await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি।")
+        
+        entity = None
+        try:
+            entity = await client.get_entity(username)
+        except Exception:
+            # যদি সরাসরি ইউজারনেম দিয়ে না পাওয়া যায়, তবে t.me লিংক বা আইডি হিসেবে চেষ্টা করা
+            if "t.me/" in raw_text or "telegram.me/" in raw_text:
+                parts = raw_text.split("t.me/")[-1].split("/")[0].split("?")[0]
+                if parts:
+                    try:
+                        entity = await client.get_entity("@" + parts.lstrip("@"))
+                    except Exception:
+                        pass
+            if not entity:
+                # যদি ইউজারনেম কাজ না করে তবে পূর্ণ লিংক দিয়ে হ্যান্ডেল করা
+                try:
+                    entity = await client.get_entity(raw_text)
+                except Exception:
+                    pass
+
+        if not entity or not isinstance(entity, (types.Channel, types.Chat)):
+            await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি বা এই অ্যাকাউন্টে প্রবেশাধিকার নেই।")
             return
+            
         title = getattr(entity, "title", username)
         with db.cursor() as cur:
             cur.execute(
