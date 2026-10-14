@@ -29,9 +29,9 @@ from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-=========================================================
-CONFIGURATION
-=========================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 load_dotenv()
 
@@ -58,9 +58,9 @@ if not API_ID:
 if not API_HASH:
     raise RuntimeError("API_HASH missing in environment variables")
 
-=========================================================
-LOGGING
-=========================================================
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,9 +69,9 @@ logging.basicConfig(
 
 logger = logging.getLogger("AutoSpeaker")
 
-=========================================================
-DATABASE
-=========================================================
+# =========================================================
+# DATABASE
+# =========================================================
 
 db = sqlite3.connect(
     DB_FILE,
@@ -168,9 +168,9 @@ def update_setting(key, value):
     db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
     db.commit()
 
-=========================================================
-BOT INITIALIZATION
-=========================================================
+# =========================================================
+# BOT INITIALIZATION
+# =========================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -182,9 +182,9 @@ clients = {}
 client_locks = {}
 monitor_locks = {}
 
-=========================================================
-STATES
-=========================================================
+# =========================================================
+# STATES
+# =========================================================
 
 class StringSessionState(StatesGroup):
     waiting_session = State()
@@ -212,18 +212,18 @@ class DepositState(StatesGroup):
 class EditSettingsState(StatesGroup):
     waiting_value = State()
 
-=========================================================
-LOCKS
-=========================================================
+# =========================================================
+# LOCKS
+# =========================================================
 
 def get_lock(lock_map, user_id):
     if user_id not in lock_map:
         lock_map[user_id] = asyncio.Lock()
     return lock_map[user_id]
 
-=========================================================
-KEYBOARDS
-=========================================================
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
 def main_keyboard(user_id=None):
     kb = [
@@ -290,9 +290,9 @@ def main_menu(user_id=None):
 
     return InlineKeyboardMarkup(inline_keyboard=inline_kb)
 
-=========================================================
-DATABASE HELPERS
-=========================================================
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
 
 def is_connected_user(user_id):
     row = db.execute(
@@ -316,9 +316,9 @@ def get_channel(owner_id, channel_type):
         (owner_id, channel_type),
     ).fetchone()
 
-=========================================================
-TELETHON CLIENT
-=========================================================
+# =========================================================
+# TELETHON CLIENT
+# =========================================================
 
 def get_client(user_id):
     if user_id not in clients:
@@ -382,9 +382,9 @@ async def disconnect_client(user_id):
             if client.is_connected():
                 await client.disconnect()
 
-=========================================================
-START
-=========================================================
+# =========================================================
+# START
+# =========================================================
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
@@ -448,9 +448,9 @@ async def admin_panel_kb_callback(call: CallbackQuery):
     )
     await show_admin_panel(call.message)
 
-=========================================================
-HELP
-=========================================================
+# =========================================================
+# HELP
+# =========================================================
 
 async def send_help(message: Message):
     user_id = message.chat.id
@@ -478,9 +478,9 @@ async def help_callback(call: CallbackQuery):
     await call.answer()
     await send_help(call.message)
 
-=========================================================
-TOP-UP & DEPOSIT SYSTEM
-=========================================================
+# =========================================================
+# TOP-UP & DEPOSIT SYSTEM
+# =========================================================
 
 @router.message(F.text == "💰 Top-up")
 async def topup_text_handler(message: Message, state: FSMContext):
@@ -628,9 +628,9 @@ async def reject_deposit(call: CallbackQuery):
             f"❌ আপনার ${dep['amount_usd']} ডিপোজিট রিকোয়েস্টটি বাতিল করা হয়েছে।"
         )
 
-=========================================================
-PROFILE & BOT ON/OFF SYSTEM
-=========================================================
+# =========================================================
+# PROFILE & BOT ON/OFF SYSTEM
+# =========================================================
 
 @router.message(F.text == "👤 Profile")
 async def profile_text_handler(message: Message):
@@ -686,9 +686,9 @@ async def toggle_bot_status(call: CallbackQuery):
     db.commit()
     await show_profile(call.message)
 
-=========================================================
-CONNECT TELEGRAM
-=========================================================
+# =========================================================
+# CONNECT TELEGRAM
+# =========================================================
 
 @router.message(F.text == "🔐 Connect Telegram")
 async def connect_text_handler(message: Message, state: FSMContext):
@@ -806,9 +806,9 @@ async def process_string_session(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID এবং API_HASH যাচাই করে আবার চেষ্টা করো।")
 
-=========================================================
-ADMIN SESSION USER MENU
-=========================================================
+# =========================================================
+# ADMIN SESSION USER MENU
+# =========================================================
 
 @router.message(F.text == "🤖 Admin Session")
 async def admin_session_text_handler(message: Message):
@@ -874,9 +874,9 @@ async def select_admin_session(call: CallbackQuery):
         reply_markup=main_menu(user_id),
     )
 
-=========================================================
-TARGET & LIVE CHANNEL MENUS
-=========================================================
+# =========================================================
+# TARGET & LIVE CHANNEL MENUS
+# =========================================================
 
 @router.message(F.text == "🎯 Target Channel")
 async def target_text_handler(message: Message, state: FSMContext):
@@ -1018,9 +1018,9 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
         await state.clear()
         await message.answer("❌ Channel যোগ করা যায়নি।")
 
-=========================================================
-LIVE CALL FUNCTIONS & MONITOR (WITH BALANCE DEDUCTION)
-=========================================================
+# =========================================================
+# LIVE CALL FUNCTIONS & MONITOR (WITH BALANCE DEDUCTION)
+# =========================================================
 
 async def get_active_call(client, channel_username):
     entity = await client.get_entity(channel_username)
@@ -1139,9 +1139,9 @@ async def auto_monitor():
 
         await asyncio.sleep(MONITOR_INTERVAL)
 
-=========================================================
-LIVE STATUS
-=========================================================
+# =========================================================
+# LIVE STATUS
+# =========================================================
 
 @router.message(F.text == "📊 Live Status")
 async def status_text_handler(message: Message):
@@ -1178,9 +1178,9 @@ async def live_status_message(message: Message):
     except Exception:
         await message.answer("❌ Status পাওয়া যায়নি।")
 
-=========================================================
-ADMIN PANEL & USER REPORTS
-=========================================================
+# =========================================================
+# ADMIN PANEL & USER REPORTS
+# =========================================================
 
 @router.message(F.text == "👑 Admin Panel")
 async def admin_panel_text(message: Message):
@@ -1508,9 +1508,9 @@ async def admin_unblock_user(call: CallbackQuery):
     db.commit()
     await call.message.edit_text(f"🔓 ইউজার <code>{target_id}</code> আনব্লক করা হয়েছে।", parse_mode="HTML")
 
-=========================================================
-FLASK WEB SERVER & KEEP-ALIVE
-=========================================================
+# =========================================================
+# FLASK WEB SERVER & KEEP-ALIVE
+# =========================================================
 
 web_app = Flask(__name__)
 
@@ -1541,9 +1541,9 @@ def keep_alive():
     t_ping.daemon = True
     t_ping.start()
 
-=========================================================
-MAIN
-=========================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 async def main():
     logger.info("Telegram Auto Speaker starting...")
