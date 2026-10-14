@@ -1,7 +1,5 @@
 aiogram
-Telethon
-Flask
+telethon
 python-dotenv
 requests
-psycopg2-binary
-asyncpg
+Flask
