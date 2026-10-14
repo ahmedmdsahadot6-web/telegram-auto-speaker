@@ -893,37 +893,48 @@ async def save_live_channel(message: Message, state: FSMContext):
 async def save_channel(message: Message, state: FSMContext, channel_type: str):
     uid = message.chat.id
     raw_text = (message.text or "").strip()
-    username = normalize_username(raw_text)
-    if not username or username == "@":
-        await message.answer("❌ সঠিক Channel লিংক অথবা username দিন, যেমন @MyChannel")
-        return
     try:
         client = await ensure_client(uid)
-        
         entity = None
+        
+        # বিভিন্ন ফরমেটে চ্যানেল খুঁজে পাওয়ার চেষ্টা করা
         try:
-            entity = await client.get_entity(username)
+            entity = await client.get_entity(raw_text)
         except Exception:
-            # যদি সরাসরি ইউজারনেম দিয়ে না পাওয়া যায়, তবে t.me লিংক বা আইডি হিসেবে চেষ্টা করা
-            if "t.me/" in raw_text or "telegram.me/" in raw_text:
-                parts = raw_text.split("t.me/")[-1].split("/")[0].split("?")[0]
-                if parts:
-                    try:
-                        entity = await client.get_entity("@" + parts.lstrip("@"))
-                    except Exception:
-                        pass
-            if not entity:
-                # যদি ইউজারনেম কাজ না করে তবে পূর্ণ লিংক দিয়ে হ্যান্ডেল করা
+            pass
+            
+        if not entity:
+            username = normalize_username(raw_text)
+            try:
+                entity = await client.get_entity(username)
+            except Exception:
+                pass
+
+        if not entity and ("t.me/" in raw_text or "telegram.me/" in raw_text):
+            parts = raw_text.split("t.me/")[-1].split("/")[0].split("?")[0]
+            if parts:
                 try:
-                    entity = await client.get_entity(raw_text)
+                    entity = await client.get_entity("@" + parts.lstrip("@"))
                 except Exception:
                     pass
+
+        # যদি প্রাইভেট লিংক বা জয়েন হাশ থাকে
+        if not entity and ("+" in raw_text or "joinchat" in raw_text):
+            try:
+                invite_hash = raw_text.split("/")[-1].replace("+", "").strip()
+                updates = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+                if updates.chats:
+                    entity = updates.chats[0]
+            except Exception:
+                pass
 
         if not entity or not isinstance(entity, (types.Channel, types.Chat)):
             await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি বা এই অ্যাকাউন্টে প্রবেশাধিকার নেই।")
             return
             
-        title = getattr(entity, "title", username)
+        title = getattr(entity, "title", raw_text)
+        username = f"@{entity.username}" if getattr(entity, "username", None) else raw_text
+        
         with db.cursor() as cur:
             cur.execute(
                 """INSERT INTO channels(owner_id,channel_type,channel_username,channel_id,title,active,auto_allow,created_at)
