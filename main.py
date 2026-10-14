@@ -23,11 +23,11 @@ from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-=========================================================
+# =========================================================
 
-CONFIGURATION
+# CONFIGURATION
 
-=========================================================
+# =========================================================
 
 load_dotenv()
 
@@ -56,11 +56,11 @@ format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("AutoSpeaker")
 
-=========================================================
+# =========================================================
 
-DATABASE
+# DATABASE
 
-=========================================================
+# =========================================================
 
 db = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
 db.row_factory = sqlite3.Row
@@ -200,11 +200,11 @@ return db.execute(
 "SELECT 1 FROM user_admin_sessions WHERE user_id=?", (user_id,)
 ).fetchone() is not None
 
-=========================================================
+# =========================================================
 
-BOT / TELETHON CLIENTS
+# BOT / TELETHON CLIENTS
 
-=========================================================
+# =========================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -263,11 +263,11 @@ with suppress(Exception):
 if client.is_connected():
 await client.disconnect()
 
-=========================================================
+# =========================================================
 
-STATES
+# STATES
 
-=========================================================
+# =========================================================
 
 class StringSessionState(StatesGroup):
 waiting_session = State()
@@ -298,11 +298,11 @@ waiting_rate = State()
 waiting_minimum = State()
 waiting_charge = State()
 
-=========================================================
+# =========================================================
 
-KEYBOARDS
+# KEYBOARDS
 
-=========================================================
+# =========================================================
 
 def user_keyboard(user_id):
 rows = [
@@ -364,11 +364,11 @@ InlineKeyboardButton(text="❌ Reject", callback_data=f"dep_reject_{request_id}"
 def admin_only(user_id):
 return is_admin(user_id)
 
-=========================================================
+# =========================================================
 
-START / MENUS
+# START / MENUS
 
-=========================================================
+# =========================================================
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
@@ -431,11 +431,11 @@ uid = call.from_user.id
 await call.message.answer("👇 User Main Menu", reply_markup=user_keyboard(uid))
 await call.message.answer("Control Panel:", reply_markup=main_menu_inline(uid))
 
-=========================================================
+# =========================================================
 
-PROFILE / BOT TOGGLE / TOP-UP
+# PROFILE / BOT TOGGLE / TOP-UP
 
-=========================================================
+# =========================================================
 
 def profile_text(user_id):
 u = user_row(user_id)
@@ -648,11 +648,11 @@ with suppress(Exception):
 await bot.send_message(req["user_id"], f"❌ আপনার Deposit #{request_id} Reject করা হয়েছে। প্রয়োজনে অ্যাডমিনের সঙ্গে যোগাযোগ করুন।")
 await call.message.edit_caption(caption=f"❌ Deposit #{request_id} REJECTED", reply_markup=None)
 
-=========================================================
+# =========================================================
 
-HELP / TELEGRAM SESSION CONNECTION
+# HELP / TELEGRAM SESSION CONNECTION
 
-=========================================================
+# =========================================================
 
 async def send_help(message: Message):
 await message.answer(
@@ -762,11 +762,11 @@ await client.disconnect()
 await state.clear()
 await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID ও API_HASH যাচাই করুন।")
 
-=========================================================
+# =========================================================
 
-ADMIN SESSION SELECTOR (legacy feature)
+# ADMIN SESSION SELECTOR (legacy feature)
 
-=========================================================
+# =========================================================
 
 @router.message(F.text == "🤖 Admin Session")
 async def admin_session_text_handler(message: Message):
@@ -808,11 +808,11 @@ db.commit()
 await disconnect_client(uid)
 await call.message.answer(f"✅ Admin Session নির্বাচিত: @{row['username']}", reply_markup=user_keyboard(uid))
 
-=========================================================
+# =========================================================
 
-TARGET / LIVE CHANNEL SETUP
+# TARGET / LIVE CHANNEL SETUP
 
-=========================================================
+# =========================================================
 
 @router.message(F.text == "🎯 Target Channel")
 async def target_text_handler(message: Message, state: FSMContext):
@@ -914,11 +914,11 @@ logger.exception("Channel setup failed: user=%s type=%s", uid, channel_type)
 await state.clear()
 await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
 
-=========================================================
+# =========================================================
 
-LIVE CALL HELPERS
+# LIVE CALL HELPERS
 
-=========================================================
+# =========================================================
 
 async def get_active_call(client, channel_username):
 entity = await client.get_entity(channel_username)
@@ -952,11 +952,11 @@ return await client(functions.phone.EditGroupCallParticipantRequest(
 call=input_call, participant=input_user, muted=False
 ))
 
-=========================================================
+# =========================================================
 
-LIVE BILLING + MONITOR
+# LIVE BILLING + MONITOR
 
-=========================================================
+# =========================================================
 
 async def charge_live_minute(user_id):
 """Charge only full live minutes. Atomic conditional update prevents negative balances."""
@@ -1153,11 +1153,11 @@ except Exception:
 logger.exception("Status check failed for user %s", uid)
 await message.answer("❌ Status পাওয়া যায়নি। Session, channel access ও live call যাচাই করুন।")
 
-=========================================================
+# =========================================================
 
-ADMIN: DEPOSIT REQUESTS / SETTINGS / REPORTS
+# ADMIN: DEPOSIT REQUESTS / SETTINGS / REPORTS
 
-=========================================================
+# =========================================================
 
 @router.message(F.text == "💰 Deposit Requests")
 async def deposits_text(message: Message):
@@ -1562,11 +1562,11 @@ text = "👥 <b>Admin Session ব্যবহারকারী</b>\n\n"
 text += "\n".join(f"• <code>{r['user_id']}</code> — @{r['username']}" for r in rows) if rows else "কেউ ব্যবহার করছে না।"
 await call.message.answer(text, parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
-=========================================================
+# =========================================================
 
-WEB SERVER / KEEP-ALIVE
+# WEB SERVER / KEEP-ALIVE
 
-=========================================================
+# =========================================================
 
 web_app = Flask(name)
 
@@ -1594,11 +1594,11 @@ Thread(target=run_web, daemon=True).start()
 if os.environ.get("RENDER_EXTERNAL_URL", "").strip():
 Thread(target=ping_self, daemon=True).start()
 
-=========================================================
+# =========================================================
 
-MAIN
+# MAIN
 
-=========================================================
+# =========================================================
 
 async def main():
 logger.info("Telegram Auto Speaker starting...")
