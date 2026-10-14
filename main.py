@@ -71,7 +71,6 @@ class PostgresDBWrapper:
         conn = get_db_connection()
         try:
             cur = conn.cursor()
-            # Convert SQLite style '?' placeholders to PostgreSQL '%s' placeholders
             pg_query = query.replace('?', '%s')
             cur.execute(pg_query, params or ())
             try:
@@ -937,10 +936,26 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
         return
     try:
         client = await ensure_client(uid)
-        entity = await client.get_entity(username)
+        
+        # Try resolving the entity safely
+        entity = None
+        try:
+            entity = await client.get_entity(username)
+        except Exception:
+            # If standard get_entity fails, try joining or importing chat invite if it's an invite link
+            if "joinchat" in raw_input or "+" in raw_input:
+                from telethon.tl.functions.messages import ImportChatInviteRequest
+                invite_hash = raw_input.split("/")[-1].replace("+", "")
+                updates = await client(ImportChatInviteRequest(invite_hash))
+                if updates.chats:
+                    entity = updates.chats[0]
+            else:
+                raise
+
         if not isinstance(entity, (types.Channel, types.Chat)):
             await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি।")
             return
+        
         title = getattr(entity, "title", username)
         db.execute(
             """INSERT INTO channels(owner_id,channel_type,channel_username,channel_id,title,active,auto_allow,created_at)
@@ -960,7 +975,7 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
     except Exception:
         logger.exception("Channel setup failed: user=%s type=%s", uid, channel_type)
         await state.clear()
-        await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
+        await message.answer("❌ Channel যোগ করা যায়নি। প্রথমে আপনার কানেক্ট করা অ্যাকাউন্ট দিয়ে এই চ্যানেলে জয়েন (Join) করে নিন, অথবা Username ও access যাচাই করুন।")
 
 # =========================================================
 # LIVE CALL HELPERS (Optimized & Limit Expanded)
@@ -973,7 +988,6 @@ async def get_active_call(client, channel_username):
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
-    # Increased limit to 500 to handle 200+ users seamlessly
     result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=500))
     users = {user.id: user for user in getattr(result, "users", [])}
     return list(getattr(result, "participants", [])), users
@@ -1071,7 +1085,6 @@ async def monitor_user(user_id):
             target_entity = await client.get_entity(target_row["channel_username"])
             participants, users = await get_participants(client, call)
             
-            # Optimized concurrent verification for speed (handling 200+ users fast)
             async def process_participant(participant):
                 peer = getattr(participant, "peer", None)
                 if not isinstance(peer, types.PeerUser):
@@ -1098,7 +1111,6 @@ async def monitor_user(user_id):
                 except Exception:
                     logger.exception("Could not unmute participant %s", uid)
 
-            # Process participants concurrently in batches for high speed
             batch_size = 15
             for i in range(0, len(participants), batch_size):
                 batch = participants[i:i + batch_size]
