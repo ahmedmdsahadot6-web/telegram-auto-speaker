@@ -1,7 +1,7 @@
-aiogram==3.13.1
-Telethon==1.36.0
-Flask==3.0.3
-python-dotenv==1.0.1
-requests==2.31.0
-psycopg2-binary==2.9.9
-asyncpg==0.29.0
+aiogram
+Telethon
+Flask
+python-dotenv
+requests
+psycopg2-binary
+asyncpg
