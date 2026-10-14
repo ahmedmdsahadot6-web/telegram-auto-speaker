@@ -656,6 +656,10 @@ async def help_callback(call: CallbackQuery):
     await call.answer()
     await send_help(call.message)
 
+# =========================================================
+# CONNECT TELEGRAM (STRING SESSION LOGIC)
+# =========================================================
+
 @router.message(F.text == "🔐 Connect Telegram")
 async def connect_text_handler(message: Message, state: FSMContext):
     await connect_telegram_menu(message, state)
@@ -667,80 +671,113 @@ async def connect_callback(call: CallbackQuery, state: FSMContext):
 
 async def connect_telegram_menu(message: Message, state: FSMContext):
     user_id = message.chat.id
-    if is_blocked(user_id):
-        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
-        return
+
     if is_connected_user(user_id):
         try:
             client = await ensure_client(user_id)
             me = await client.get_me()
-            await message.answer(
-                f"✅ Telegram Already Connected\nAccount ID: {me.id}",
-                reply_markup=user_keyboard(user_id),
-            )
-            return
-        except Exception:
-            await disconnect_client(user_id)
-            db.execute("UPDATE users SET connected=0 WHERE user_id=?", (user_id,))
+
+            await message.answer(        
+                "✅ <b>Telegram Already Connected</b>\n\n"        
+                f"Account ID: <code>{me.id}</code>\n\n"        
+                "এখন Target ও Live Channel সেট করো。",        
+                parse_mode="HTML",        
+                reply_markup=user_keyboard(user_id),        
+            )        
+            return        
+
+        except Exception:        
+            logger.warning("Saved Telegram session invalid for user %s", user_id)        
+            await disconnect_client(user_id)        
+            db.execute("UPDATE users SET connected=0 WHERE user_id=?", (user_id,))        
             db.commit()
+
     await state.set_state(StringSessionState.waiting_session)
     await message.answer(
         "🔐 <b>Connect via String Session</b>\n\n"
-        "শুধু নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর session পাঠান।\n"
-        "⚠️ String Session অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কারও সঙ্গে শেয়ার করবেন না।",
+        "নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর "
+        "Telethon String Session পাঠাও。\n\n"
+        "⚠️ এটি অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কাউকে শেয়ার করবে না।",
         parse_mode="HTML",
     )
 
 @router.message(StringSessionState.waiting_session)
 async def process_string_session(message: Message, state: FSMContext):
     if not message.text:
-        await message.answer("❌ String Session টেক্সট হিসেবে পাঠান।")
+        await message.answer("❌ String Session টেক্সট হিসেবে পাঠাও।")
         return
+
     session_string = message.text.strip()
     user_id = message.chat.id
+
     if len(session_string) < 30:
-        await message.answer("❌ Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করুন।")
+        await message.answer("❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো।")
         return
+
     await disconnect_client(user_id)
+
     client = TelegramClient(
-        StringSession(session_string), API_ID, API_HASH,
-        device_model="Telegram Auto Speaker", system_version="Python",
-        app_version="1.0", connection_retries=3, timeout=30, auto_reconnect=True,
+        StringSession(session_string),
+        API_ID,
+        API_HASH,
+        device_model="Telegram Auto Speaker",
+        system_version="Python",
+        app_version="1.0",
+        connection_retries=5,
+        timeout=30,
+        auto_reconnect=True,
     )
+
     try:
         await client.connect()
-        if not await client.is_user_authorized():
-            await client.disconnect()
-            await message.answer("❌ Session অনুমোদিত নয় বা মেয়াদোত্তীর্ণ।")
-            return
-        me = await client.get_me()
-        if not me:
-            await client.disconnect()
-            await message.answer("❌ Telegram account যাচাই করা যায়নি।")
-            return
-        clients[user_id] = client
-        db.execute(
-            """INSERT INTO users(user_id,session_string,connected,blocked,created_at)
-            VALUES(?,?,1,0,?)
-            ON CONFLICT(user_id) DO UPDATE SET session_string=excluded.session_string,
-            connected=1, created_at=excluded.created_at""",
-            (user_id, session_string, int(time.time())),
+
+        if not await client.is_user_authorized():        
+            await client.disconnect()        
+            await message.answer("❌ Session অনুমোদিত নয় বা মেয়াদোত্তীর্ণ। সঠিক session দিয়ে আবার চেষ্টা করো।")        
+            return        
+
+        me = await client.get_me()        
+
+        if not me:        
+            await client.disconnect()        
+            await message.answer("❌ Telegram account যাচাই করা যায়নি।")        
+            return        
+
+        clients[user_id] = client        
+
+        db.execute(        
+            """        
+            INSERT INTO users        
+                (user_id, session_string, connected, blocked, created_at)        
+            VALUES (?, ?, 1, 0, ?)        
+            ON CONFLICT(user_id) DO UPDATE SET        
+                session_string=excluded.session_string,        
+                connected=1,        
+                created_at=excluded.created_at        
+            """,        
+            (user_id, session_string, int(time.time())),        
+        )    
+        db.execute("DELETE FROM user_admin_sessions WHERE user_id=?", (user_id,))    
+        db.commit()        
+
+        await state.clear()        
+        with suppress(Exception):        
+            await message.delete()        
+
+        await message.answer(        
+            "✅ <b>Telegram Connected Successfully!</b>\n\n"        
+            f"Account ID: <code>{me.id}</code>\n\n"        
+            "এখন Target ও Live Channel সেট করো।",        
+            parse_mode="HTML",        
+            reply_markup=user_keyboard(user_id),        
         )
-        db.execute("DELETE FROM user_admin_sessions WHERE user_id=?", (user_id,))
-        db.commit()
-        await state.clear()
-        with suppress(Exception):
-            await message.delete()
-        await message.answer(
-            f"✅ Telegram Connected Successfully!\nAccount ID: {me.id}",
-            reply_markup=user_keyboard(user_id),
-        )
+
     except Exception:
         logger.exception("Telegram session connection failed for user %s", user_id)
-        with suppress(Exception):
-            await client.disconnect()
-        await state.clear()
-        await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID ও API_HASH যাচাই করুন।")
+        with suppress(Exception):        
+            await client.disconnect()        
+        await state.clear()        
+        await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID এবং API_HASH যাচাই করে আবার চেষ্টা করো।")
 
 # =========================================================
 # ADMIN SESSION SELECTOR
@@ -854,39 +891,56 @@ async def save_target_channel(message: Message, state: FSMContext):
 async def save_live_channel(message: Message, state: FSMContext):
     await save_channel(message, state, "live")
 
+# =========================================================
+# TARGET & LIVE CHANNELS (CONNECT LOGIC)
+# =========================================================
+
 async def save_channel(message: Message, state: FSMContext, channel_type: str):
-    uid = message.chat.id
+    user_id = message.chat.id
     username = normalize_username(message.text)
+
     if not username or username == "@":
-        await message.answer("❌ সঠিক public Channel username দিন, যেমন @MyChannel")
+        await message.answer("❌ সঠিক public Channel username দাও, যেমন @MyChannel")
         return
+
     try:
-        client = await ensure_client(uid)
-        entity = await client.get_entity(username)
-        if not isinstance(entity, (types.Channel, types.Chat)):
-            await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি।")
-            return
-        title = getattr(entity, "title", username)
-        db.execute(
-            """INSERT INTO channels(owner_id,channel_type,channel_username,channel_id,title,active,auto_allow,created_at)
-            VALUES(?,?,?,?,?,1,1,?)
-            ON CONFLICT(owner_id,channel_type) DO UPDATE SET
-            channel_username=excluded.channel_username,channel_id=excluded.channel_id,
-            title=excluded.title,active=1,created_at=excluded.created_at""",
-            (uid, channel_type, username, entity.id, title, int(time.time())),
-        )
-        db.commit()
-        await state.clear()
-        await message.answer(
-            f"✅ {channel_type.title()} Channel Added\n📺 {title}\n🔗 {username}",
-            reply_markup=user_keyboard(uid),
-        )
-    except FloodWaitError as exc:
-        await message.answer(f"⏳ Telegram বিরতি চেয়েছে। {exc.seconds} সেকেন্ড পরে চেষ্টা করুন।")
-    except Exception:
-        logger.exception("Channel setup failed: user=%s type=%s", uid, channel_type)
-        await state.clear()
-        await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
+        client = await ensure_client(user_id)
+        
+        try:
+            entity = await client.get_entity(username)
+        except Exception:
+            entity = await client.get_entity(message.text.strip())
+
+        if not isinstance(entity, (types.Channel, types.Chat)):        
+            await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি।")        
+            return        
+
+        title = getattr(entity, "title", username)        
+        channel_id = getattr(entity, "id", None)
+
+        db.execute(        
+            """        
+            INSERT INTO channels (owner_id, channel_type, channel_username, channel_id, title, active, auto_allow, created_at)        
+            VALUES (?, ?, ?, ?, ?, 1, 1, ?)        
+            ON CONFLICT(owner_id, channel_type) DO UPDATE SET        
+                channel_username=excluded.channel_username,        
+                channel_id=excluded.channel_id,        
+                title=excluded.title,        
+                active=1,        
+                created_at=excluded.created_at        
+            """,        
+            (user_id, channel_type, username, channel_id, title, int(time.time())),        
+        )        
+        db.commit()        
+        await state.clear()        
+
+        text = f"✅ <b>Channel Added Successfully</b>\n\n📺 {title}\n🔗 {username}"
+        await message.answer(text, parse_mode="HTML", reply_markup=user_keyboard(user_id))
+
+    except Exception as e:
+        logger.exception("Channel setup failed: %s", e)
+        await state.clear()        
+        await message.answer("❌ Channel যোগ করা যায়নি। ইউজারনেম সঠিক আছে কি না অথবা ওই অ্যাকাউন্টের চ্যানেলে অ্যাক্সেস আছে কিনা তা যাচাই করুন।")
 
 # =========================================================
 # LIVE CALL HELPERS
