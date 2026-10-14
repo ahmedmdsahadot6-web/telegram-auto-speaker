@@ -71,6 +71,7 @@ class PostgresDBWrapper:
         conn = get_db_connection()
         try:
             cur = conn.cursor()
+            # Convert SQLite style '?' placeholders to PostgreSQL '%s' placeholders
             pg_query = query.replace('?', '%s')
             cur.execute(pg_query, params or ())
             try:
@@ -972,6 +973,7 @@ async def get_active_call(client, channel_username):
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+    # Increased limit to 500 to handle 200+ users seamlessly
     result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=500))
     users = {user.id: user for user in getattr(result, "users", [])}
     return list(getattr(result, "participants", [])), users
@@ -1069,6 +1071,7 @@ async def monitor_user(user_id):
             target_entity = await client.get_entity(target_row["channel_username"])
             participants, users = await get_participants(client, call)
             
+            # Optimized concurrent verification for speed (handling 200+ users fast)
             async def process_participant(participant):
                 peer = getattr(participant, "peer", None)
                 if not isinstance(peer, types.PeerUser):
@@ -1095,6 +1098,7 @@ async def monitor_user(user_id):
                 except Exception:
                     logger.exception("Could not unmute participant %s", uid)
 
+            # Process participants concurrently in batches for high speed
             batch_size = 15
             for i in range(0, len(participants), batch_size):
                 batch = participants[i:i + batch_size]
