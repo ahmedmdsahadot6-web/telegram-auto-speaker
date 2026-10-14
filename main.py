@@ -37,7 +37,7 @@ except ValueError:
 
 PORT = int(os.getenv("PORT", "10000"))
 DB_FILE = os.getenv("DB_FILE", "speaker_manager.db")
-MONITOR_INTERVAL = max(3, int(os.getenv("MONITOR_INTERVAL", "5")))
+MONITOR_INTERVAL = max(2, int(os.getenv("MONITOR_INTERVAL", "3")))
 ADMIN_IDS = [7871224176, 8454401183]
 
 if not BOT_TOKEN:
@@ -964,7 +964,7 @@ async def get_active_call(client, channel_username):
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
-    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=100))
+    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=200))
     users = {user.id: user for user in getattr(result, "users", [])}
     return list(getattr(result, "participants", [])), users
 
@@ -1091,12 +1091,12 @@ async def monitor_user(user_id):
                     logger.info("Unmute request sent for user=%s", uid)
                 except FloodWaitError as exc:
                     logger.warning("FloodWait %s seconds", exc.seconds)
-                    await asyncio.sleep(min(exc.seconds, 60))
+                    await asyncio.sleep(min(exc.seconds, 30))
                 except RPCError as exc:
                     logger.warning("Telegram rejected unmute for %s: %s", uid, exc)
                 except Exception:
                     logger.exception("Could not unmute participant %s", uid)
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.02)
         except FloodWaitError as exc:
             logger.warning("Monitor FloodWait user=%s seconds=%s", user_id, exc.seconds)
         except RPCError as exc:
@@ -1112,7 +1112,7 @@ async def auto_monitor():
             rows = db.execute("SELECT user_id FROM users WHERE bot_enabled=1 AND blocked=0").fetchall()
             for row in rows:
                 await monitor_user(row["user_id"])
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1180,7 +1180,7 @@ async def live_status_message(message: Message):
                 muted += 1
             else:
                 allowed += 1
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
         await message.answer(
             f"🎙 <b>LIVE STATUS</b>\n\n🎯 Target: {target['title']}\n📺 Live: {live['title']}\n"
             f"👥 শনাক্ত Target Members: {members}\n🔇 Muted: {muted}\n🎤 Unmuted: {allowed}\n"
