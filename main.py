@@ -2,8 +2,6 @@ import os
 import time
 import asyncio
 import logging
-import psycopg2
-import psycopg2.extras
 from contextlib import suppress
 from threading import Thread
 
@@ -38,7 +36,6 @@ except ValueError:
     API_ID = 0
 
 PORT = int(os.getenv("PORT", "10000"))
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_isXKv4Vco5WU@ep-twilight-queen-b4lzzs65-pooler.c-6.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require")
 MONITOR_INTERVAL = max(2, int(os.getenv("MONITOR_INTERVAL", "3")))
 ADMIN_IDS = [7871224176, 8454401183]
 
@@ -56,41 +53,28 @@ logging.basicConfig(
 logger = logging.getLogger("AutoSpeaker")
 
 # =========================================================
-# DATABASE (PostgreSQL / Neon)
+# IN-MEMORY DATABASE STORAGE
 # =========================================================
 
-def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn
-
-class PostgresDBWrapper:
-    def __init__(self):
-        pass
-
-    def execute(self, query, params=None):
-        conn = get_db_connection()
-        try:
-            cur = conn.cursor()
-            pg_query = query.replace('?', '%s')
-            cur.execute(pg_query, params or ())
-            try:
-                res = cur.fetchall()
-            except psycopg2.ProgrammingError:
-                res = []
-            conn.commit()
-            cur.close()
-            conn.close()
-            return DBResult(res)
-        except Exception as e:
-            conn.rollback()
-            conn.close()
-            raise e
-
-db = PostgresDBWrapper()
+MEM_USERS = {}
+MEM_CHANNELS = {}
+MEM_ADMIN_SESSIONS = {}
+MEM_USER_ADMIN_SESSIONS = {}
+MEM_DEPOSIT_REQUESTS = {}
+MEM_SETTINGS = {
+    "binance_pay_id": "839892941",
+    "coins_per_dollar": "65000",
+    "min_deposit_usd": "1",
+    "coins_per_minute": "1000",
+}
+deposit_id_counter = 1
+channel_id_counter = 1
+admin_session_id_counter = 1
 
 class DBResult:
     def __init__(self, rows):
         self._rows = rows
+        self.rowcount = len(rows)
 
     def fetchone(self):
         return self._rows[0] if self._rows else None
@@ -104,140 +88,305 @@ class DBResult:
     def __getitem__(self, index):
         return self._rows[index]
 
+class InMemoryDBWrapper:
+    def execute(self, query, params=None):
+        global deposit_id_counter, channel_id_counter, admin_session_id_counter
+        q = query.strip().upper()
+        params = params or ()
+
+        if "SELECT VALUE FROM SETTINGS WHERE KEY=" in q:
+            key = params[0]
+            val = MEM_SETTINGS.get(key, "")
+            return DBResult([{"value": val}] if val != "" else [])
+
+        elif "INSERT INTO SETTINGS" in q:
+            key, val = params[0], params[1]
+            MEM_SETTINGS[key] = val
+            return DBResult([])
+
+        elif "SELECT * FROM USERS WHERE USER_ID=" in q:
+            uid = params[0]
+            user = MEM_USERS.get(uid)
+            return DBResult([user] if user else [])
+
+        elif "INSERT INTO USERS" in q and "ON CONFLICT" in q:
+            uid, conn_val, blocked_val, created_val = params[0], params[1], params[2], params[3]
+            if uid not in MEM_USERS:
+                MEM_USERS[uid] = {
+                    "user_id": uid,
+                    "session_string": "",
+                    "connected": conn_val,
+                    "blocked": blocked_val,
+                    "created_at": created_val,
+                    "balance": 10000,
+                    "total_spent": 0,
+                    "bot_enabled": 0,
+                    "billing_seconds": 0,
+                    "billing_last_ts": 0
+                }
+            return DBResult([])
+
+        elif "UPDATE USERS SET SESSION_STRING=" in q or "UPDATE USERS SET CONNECTED=" in q:
+            # Simple fallback update handler
+            for uid, udata in MEM_USERS.items():
+                if uid == params[-1]:
+                    pass
+            return DBResult([])
+
+        elif "SELECT COUNT(*) AS C FROM USERS" in q:
+            return DBResult([{"c": len(MEM_USERS)}])
+
+        elif "SELECT COUNT(*) AS C FROM DEPOSIT_REQUESTS" in q:
+            pending_count = sum(1 for d in MEM_DEPOSIT_REQUESTS.values() if d["status"] == 'pending')
+            return DBResult([{"c": pending_count}])
+
+        elif "SELECT * FROM CHANNELS WHERE OWNER_ID=" in q:
+            owner_id, channel_type = params[0], params[1]
+            for ch in MEM_CHANNELS.values():
+                if ch["owner_id"] == owner_id and ch["channel_type"] == channel_type and ch["active"] == 1:
+                    return DBResult([ch])
+            return DBResult([])
+
+        elif "SELECT CHANNEL_TYPE, TITLE, CHANNEL_USERNAME FROM CHANNELS WHERE OWNER_ID=" in q:
+            owner_id = params[0]
+            res = [ch for ch in MEM_CHANNELS.values() if ch["owner_id"] == owner_id and ch.get("active", 1) == 1]
+            return DBResult(res)
+
+        elif "SELECT CHANNEL_TYPE,CHANNEL_USERNAME,TITLE FROM CHANNELS WHERE OWNER_ID=" in q:
+            owner_id = params[0]
+            res = [ch for ch in MEM_CHANNELS.values() if ch["owner_id"] == owner_id]
+            return DBResult(res)
+
+        elif "INSERT INTO CHANNELS" in q:
+            owner_id, channel_type, username, channel_id, title, active, auto_allow, created_at = params
+            # Check unique owner_id & channel_type
+            found_key = None
+            for k, ch in MEM_CHANNELS.items():
+                if ch["owner_id"] == owner_id and ch["channel_type"] == channel_type:
+                    found_key = k
+                    break
+            if found_key:
+                MEM_CHANNELS[found_key].update({
+                    "channel_username": username,
+                    "channel_id": channel_id,
+                    "title": title,
+                    "active": active,
+                    "auto_allow": auto_allow
+                })
+            else:
+                global channel_id_counter
+                MEM_CHANNELS[channel_id_counter] = {
+                    "id": channel_id_counter,
+                    "owner_id": owner_id,
+                    "channel_type": channel_type,
+                    "channel_username": username,
+                    "channel_id": channel_id,
+                    "title": title,
+                    "active": active,
+                    "auto_allow": auto_allow,
+                    "created_at": created_at
+                }
+                channel_id_counter += 1
+            return DBResult([])
+
+        elif "SELECT 1 FROM USER_ADMIN_SESSIONS WHERE USER_ID=" in q:
+            uid = params[0]
+            exists = uid in MEM_USER_ADMIN_SESSIONS
+            return DBResult([1] if exists else [])
+
+        elif "SELECT SESSION_STRING FROM ADMIN_SESSIONS" in q:
+            uid = params[0]
+            sess_id = MEM_USER_ADMIN_SESSIONS.get(uid)
+            if sess_id and sess_id in MEM_ADMIN_SESSIONS:
+                return DBResult([{"session_string": MEM_ADMIN_SESSIONS[sess_id]["session_string"]}])
+            return DBResult([])
+
+        elif "SELECT SESSION_STRING FROM USERS WHERE USER_ID=" in q:
+            uid = params[0]
+            user = MEM_USERS.get(uid)
+            return DBResult([{"session_string": user.get("session_string", "")}] if user else [])
+
+        elif "SELECT ID, USERNAME FROM ADMIN_SESSIONS" in q:
+            return DBResult(list(MEM_ADMIN_SESSIONS.values()))
+
+        elif "INSERT INTO ADMIN_SESSIONS" in q:
+            username, session_string, added_at = params
+            global admin_session_id_counter
+            MEM_ADMIN_SESSIONS[admin_session_id_counter] = {
+                "id": admin_session_id_counter,
+                "username": username,
+                "session_string": session_string,
+                "added_at": added_at
+            }
+            admin_session_id_counter += 1
+            return DBResult([])
+
+        elif "INSERT INTO USER_ADMIN_SESSIONS" in q:
+            uid, sid, created_at = params
+            MEM_USER_ADMIN_SESSIONS[uid] = sid
+            return DBResult([])
+
+        elif "DELETE FROM USER_ADMIN_SESSIONS WHERE USER_ID=" in q:
+            uid = params[0]
+            MEM_USER_ADMIN_SESSIONS.pop(uid, None)
+            return DBResult([])
+
+        elif "DELETE FROM USER_ADMIN_SESSIONS WHERE SESSION_ID=" in q:
+            sid = params[0]
+            for uid, s in list(MEM_USER_ADMIN_SESSIONS.items()):
+                if s == sid:
+                    MEM_USER_ADMIN_SESSIONS.pop(uid, None)
+            return DBResult([])
+
+        elif "INSERT INTO DEPOSIT_REQUESTS" in q:
+            user_id, amount_usd, coins, photo_file_id, status, created_at = params
+            global deposit_id_counter
+            rid = deposit_id_counter
+            deposit_id_counter += 1
+            MEM_DEPOSIT_REQUESTS[rid] = {
+                "id": rid,
+                "user_id": user_id,
+                "amount_usd": amount_usd,
+                "coins": coins,
+                "photo_file_id": photo_file_id,
+                "status": status,
+                "created_at": created_at,
+                "reviewed_at": None,
+                "reviewed_by": None
+            }
+            class Ret:
+                def fetchone(self):
+                    return {"id": rid}
+            return Ret()
+
+        elif "SELECT * FROM DEPOSIT_REQUESTS WHERE STATUS='PENDING'" in q or "SELECT * FROM DEPOSIT_REQUESTS WHERE STATUS='pending'" in q:
+            res = [d for d in MEM_DEPOSIT_REQUESTS.values() if d["status"] == 'pending']
+            return DBResult(res)
+
+        elif "SELECT * FROM DEPOSIT_REQUESTS WHERE ID=" in q:
+            rid = params[0]
+            d = MEM_DEPOSIT_REQUESTS.get(rid)
+            return DBResult([d] if d else [])
+
+        elif "UPDATE DEPOSIT_REQUESTS SET STATUS='ACCEPTED'" in q or "UPDATE DEPOSIT_REQUESTS SET STATUS='accepted'" in q:
+            reviewed_at, reviewed_by, rid = params
+            if rid in MEM_DEPOSIT_REQUESTS and MEM_DEPOSIT_REQUESTS[rid]["status"] == 'pending':
+                MEM_DEPOSIT_REQUESTS[rid]["status"] = 'accepted'
+                MEM_DEPOSIT_REQUESTS[rid]["reviewed_at"] = reviewed_at
+                MEM_DEPOSIT_REQUESTS[rid]["reviewed_by"] = reviewed_by
+                class ResCount:
+                    rowcount = 1
+                return ResCount()
+            class ResZero:
+                rowcount = 0
+            return ResZero()
+
+        elif "UPDATE USERS SET BALANCE=BALANCE+" in q:
+            coins, user_id = params
+            if user_id in MEM_USERS:
+                MEM_USERS[user_id]["balance"] += coins
+            return DBResult([])
+
+        elif "UPDATE DEPOSIT_REQUESTS SET STATUS='REJECTED'" in q or "UPDATE DEPOSIT_REQUESTS SET STATUS='rejected'" in q:
+            reviewed_at, reviewed_by, rid = params
+            if rid in MEM_DEPOSIT_REQUESTS:
+                MEM_DEPOSIT_REQUESTS[rid]["status"] = 'rejected'
+                MEM_DEPOSIT_REQUESTS[rid]["reviewed_at"] = reviewed_at
+                MEM_DEPOSIT_REQUESTS[rid]["reviewed_by"] = reviewed_by
+            return DBResult([])
+
+        elif "SELECT * FROM USERS ORDER BY CREATED_AT" in q:
+            res = sorted(MEM_USERS.values(), key=lambda x: x.get("created_at", 0), reverse=True)
+            return DBResult(res)
+
+        elif "SELECT USER_ID FROM USERS WHERE BOT_ENABLED=1" in q:
+            res = [{"user_id": u["user_id"]} for u in MEM_USERS.values() if u.get("bot_enabled") == 1 and u.get("blocked") == 0]
+            return DBResult(res)
+
+        elif "UPDATE USERS SET BLOCKED=1" in q:
+            uid = params[0]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["blocked"] = 1
+                MEM_USERS[uid]["bot_enabled"] = 0
+                MEM_USERS[uid]["billing_seconds"] = 0
+                MEM_USERS[uid]["billing_last_ts"] = 0
+            return DBResult([])
+
+        elif "UPDATE USERS SET BLOCKED=0" in q:
+            uid = params[0]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["blocked"] = 0
+            return DBResult([])
+
+        elif "DELETE FROM ADMIN_SESSIONS WHERE ID=" in q:
+            sid = params[0]
+            MEM_ADMIN_SESSIONS.pop(sid, None)
+            return DBResult([])
+
+        elif "SELECT UAS.USER_ID, A.USERNAME FROM USER_ADMIN_SESSIONS UAS" in q:
+            res = []
+            for uid, sid in MEM_USER_ADMIN_SESSIONS.items():
+                if sid in MEM_ADMIN_SESSIONS:
+                    res.append({"user_id": uid, "username": MEM_ADMIN_SESSIONS[sid]["username"]})
+            return DBResult(res)
+
+        elif "UPDATE USERS SET BOT_ENABLED=" in q:
+            new_val, uid = params[0], params[1]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["bot_enabled"] = new_val
+                MEM_USERS[uid]["billing_seconds"] = 0
+                MEM_USERS[uid]["billing_last_ts"] = 0
+            return DBResult([])
+
+        elif "UPDATE USERS SET BILLING_SECONDS=" in q:
+            sec, uid = params[0], params[1]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["billing_seconds"] = sec
+            return DBResult([])
+
+        elif "UPDATE USERS SET BILLING_LAST_TS=" in q:
+            ts, uid = params[0], params[1]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["billing_last_ts"] = ts
+            return DBResult([])
+
+        elif "UPDATE USERS SET BILLING_SECONDS=0, BILLING_LAST_TS=0" in q:
+            uid = params[0]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["billing_seconds"] = 0
+                MEM_USERS[uid]["billing_last_ts"] = 0
+            return DBResult([])
+
+        elif "SELECT BALANCE FROM USERS WHERE USER_ID=" in q:
+            uid = params[0]
+            user = MEM_USERS.get(uid)
+            return DBResult([{"balance": user["balance"]}] if user else [])
+
+        elif "UPDATE USERS SET BALANCE=BALANCE-" in q:
+            rate1, rate2, uid = params[0], params[1], params[2]
+            if uid in MEM_USERS:
+                MEM_USERS[uid]["balance"] -= rate1
+                MEM_USERS[uid]["total_spent"] += rate2
+            return DBResult([])
+
+        return DBResult([])
+
+db = InMemoryDBWrapper()
 db_lock = asyncio.Lock()
 
-def column_exists(table, column):
-    try:
-        res = db.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name=%s AND column_name=%s",
-            (table, column)
-        )
-        return bool(res.fetchone())
-    except Exception:
-        return False
-
-def init_db():
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            session_string TEXT,
-            connected INTEGER DEFAULT 0,
-            blocked INTEGER DEFAULT 0,
-            created_at BIGINT,
-            balance INTEGER NOT NULL DEFAULT 0,
-            total_spent INTEGER NOT NULL DEFAULT 0,
-            bot_enabled INTEGER NOT NULL DEFAULT 0,
-            billing_seconds INTEGER NOT NULL DEFAULT 0,
-            billing_last_ts BIGINT NOT NULL DEFAULT 0
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    for col, definition in (
-        ("balance", "INTEGER NOT NULL DEFAULT 0"),
-        ("total_spent", "INTEGER NOT NULL DEFAULT 0"),
-        ("bot_enabled", "INTEGER NOT NULL DEFAULT 0"),
-        ("billing_seconds", "INTEGER NOT NULL DEFAULT 0"),
-        ("billing_last_ts", "BIGINT NOT NULL DEFAULT 0"),
-    ):
-        if not column_exists("users", col):
-            try:
-                db.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
-            except Exception:
-                pass
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS channels (  
-            id SERIAL PRIMARY KEY,  
-            owner_id BIGINT NOT NULL,  
-            channel_type TEXT NOT NULL,  
-            channel_username TEXT NOT NULL,  
-            channel_id BIGINT,  
-            title TEXT,  
-            active INTEGER DEFAULT 1,  
-            auto_allow INTEGER DEFAULT 1,  
-            created_at BIGINT,  
-            UNIQUE(owner_id, channel_type)  
-        )  
-    """)  
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS admin_sessions (  
-            id SERIAL PRIMARY KEY,  
-            username TEXT NOT NULL,  
-            session_string TEXT NOT NULL,  
-            added_at BIGINT  
-        )  
-    """)  
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS user_admin_sessions (  
-            user_id BIGINT PRIMARY KEY,  
-            session_id INTEGER,  
-            created_at BIGINT  
-        )  
-    """)  
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS deposit_requests (  
-            id SERIAL PRIMARY KEY,  
-            user_id BIGINT NOT NULL,  
-            amount_usd REAL NOT NULL,  
-            coins INTEGER NOT NULL,  
-            photo_file_id TEXT NOT NULL,  
-            status TEXT NOT NULL DEFAULT 'pending',  
-            created_at BIGINT NOT NULL,  
-            reviewed_at BIGINT,  
-            reviewed_by BIGINT  
-        )  
-    """)  
-    cur.execute("""  
-        CREATE TABLE IF NOT EXISTS settings (  
-            key TEXT PRIMARY KEY,  
-            value TEXT NOT NULL  
-        )  
-    """)  
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    defaults = {  
-        "binance_pay_id": "839892941",  
-        "coins_per_dollar": "65000",  
-        "min_deposit_usd": "1",  
-        "coins_per_minute": "1000",  
-    }  
-    for key, value in defaults.items():  
-        try:
-            db.execute("INSERT INTO settings(key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", (key, value))
-        except Exception:
-            pass
-
-init_db()
-
 def setting(key):
-    row = db.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else ""
 
 def set_setting(key, value):
-    db.execute(
-        "INSERT INTO settings(key,value) VALUES(%s,%s) "
-        "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-        (key, str(value)),
-    )
+    db.execute("INSERT INTO settings(key,value) VALUES(?,?)", (key, str(value)))
 
 def ensure_user(user_id):
-    db.execute(
-        "INSERT INTO users(user_id, connected, blocked, created_at) VALUES(%s,0,0,%s) ON CONFLICT (user_id) DO NOTHING",
-        (user_id, int(time.time())),
-    )
+    db.execute("INSERT INTO users(user_id, connected, blocked, created_at) VALUES(?,0,0,?)", (user_id, int(time.time())))
 
 def user_row(user_id):
     ensure_user(user_id)
-    return db.execute("SELECT * FROM users WHERE user_id=%s", (user_id,)).fetchone()
+    return db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
@@ -251,15 +400,11 @@ def is_connected_user(user_id):
     return bool(row["connected"]) and not bool(row["blocked"])
 
 def get_channel(owner_id, channel_type):
-    return db.execute(
-        "SELECT * FROM channels WHERE owner_id=%s AND channel_type=%s AND active=1",
-        (owner_id, channel_type),
-    ).fetchone()
+    return db.execute("SELECT * FROM channels WHERE owner_id=? AND channel_type=? AND active=1", (owner_id, channel_type)).fetchone()
 
 def has_admin_session(user_id):
-    return db.execute(
-        "SELECT 1 FROM user_admin_sessions WHERE user_id=%s", (user_id,)
-    ).fetchone() is not None
+    res = db.execute("SELECT 1 FROM user_admin_sessions WHERE user_id=?", (user_id,))
+    return res.fetchone() is not None
 
 # =========================================================
 # BOT / TELETHON CLIENTS
@@ -284,16 +429,13 @@ def get_client(user_id):
         us_row = db.execute(
             """SELECT session_string FROM admin_sessions
             JOIN user_admin_sessions ON admin_sessions.id=user_admin_sessions.session_id
-            WHERE user_admin_sessions.user_id=%s""",
+            WHERE user_admin_sessions.user_id=?""",
             (user_id,),
         ).fetchone()
         if us_row and us_row["session_string"]:
             session_string = us_row["session_string"]
         else:
-            row = db.execute(
-                "SELECT session_string FROM users WHERE user_id=%s AND connected=1",
-                (user_id,),
-            ).fetchone()
+            row = db.execute("SELECT session_string FROM users WHERE user_id=? AND connected=1", (user_id,)).fetchone()
             session_string = row["session_string"] if row and row["session_string"] else ""
 
         clients[user_id] = TelegramClient(  
@@ -488,10 +630,7 @@ async def main_menu_back(call: CallbackQuery, state: FSMContext):
 
 def profile_text(user_id):
     u = user_row(user_id)
-    channels = db.execute(
-        "SELECT channel_type, title, channel_username FROM channels WHERE owner_id=%s AND active=1",
-        (user_id,),
-    ).fetchall()
+    channels = db.execute("SELECT channel_type, title, channel_username FROM channels WHERE owner_id=? AND active=1", (user_id,)).fetchall()
     channel_text = "\n".join(
         f"• {c['channel_type'].upper()}: {c['title'] or 'Unknown'} ({c['channel_username']})"
         for c in channels
@@ -533,7 +672,7 @@ async def toggle_bot(user_id, message):
         if u["balance"] <= 0:
             await message.answer("❌ আপনার Coin Balance নেই। প্রথমে 💰 Top-up করুন।")
             return
-    db.execute("UPDATE users SET bot_enabled=%s, billing_seconds=0, billing_last_ts=0 WHERE user_id=%s", (new_value, user_id))
+    db.execute("UPDATE users SET bot_enabled=?, billing_seconds=0, billing_last_ts=0 WHERE user_id=?", (new_value, user_id))
     await message.answer(
         f"{'🟢 Bot ON করা হয়েছে' if new_value else '🔴 Bot OFF করা হয়েছে'}.\n"
         "শুধু লাইভ চালু থাকলেই চার্জ কাটা হবে।",
@@ -601,18 +740,13 @@ async def deposit_photo(message: Message, state: FSMContext):
     amount = float(data["deposit_amount"])
     coins = int(data["deposit_coins"])
     
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
+    res = db.execute(
         """INSERT INTO deposit_requests
         (user_id, amount_usd, coins, photo_file_id, status, created_at)
-        VALUES(%s,%s,%s,%s, 'pending', %s) RETURNING id""",
-        (message.from_user.id, amount, coins, message.photo[-1].file_id, int(time.time())),
+        VALUES(?,?,?,?,?,?)""",
+        (message.from_user.id, amount, coins, message.photo[-1].file_id, 'pending', int(time.time())),
     )
-    request_id = cur.fetchone()["id"]
-    conn.commit()
-    cur.close()
-    conn.close()
+    request_id = res.fetchone()["id"]
 
     await state.clear()
     await message.answer(
@@ -650,26 +784,17 @@ async def deposit_accept(call: CallbackQuery):
     await call.answer()
     request_id = int(call.data.rsplit("_", 1)[1])
     try:
-        req = db.execute("SELECT * FROM deposit_requests WHERE id=%s", (request_id,)).fetchone()
+        req = db.execute("SELECT * FROM deposit_requests WHERE id=?", (request_id,)).fetchone()
         if not req or req["status"] != "pending":
             await call.message.reply("এই রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে বা পাওয়া যায়নি।")
             return
         
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE deposit_requests SET status='accepted', reviewed_at=%s, reviewed_by=%s WHERE id=%s AND status='pending'",
-                    (int(time.time()), call.from_user.id, request_id))
-        if cur.rowcount != 1:
-            conn.rollback()
-            cur.close()
-            conn.close()
+        upd = db.execute("UPDATE deposit_requests SET status='accepted', reviewed_by=?, reviewed_at=? WHERE id=?", (call.from_user.id, int(time.time()), request_id))
+        if upd.rowcount != 1:
             await call.message.reply("রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে।")
             return
         
-        cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (req["coins"], req["user_id"]))
-        conn.commit()
-        cur.close()
-        conn.close()
+        db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (req["coins"], req["user_id"]))
     except Exception:
         logger.exception("Deposit acceptance failed")
         await call.message.reply("❌ ডিপোজিট গ্রহণ করা যায়নি।")
@@ -691,13 +816,12 @@ async def deposit_reject(call: CallbackQuery):
         return
     await call.answer()
     request_id = int(call.data.rsplit("_", 1)[1])
-    req = db.execute("SELECT user_id FROM deposit_requests WHERE id=%s AND status='pending'", (request_id,)).fetchone()
+    req = db.execute("SELECT user_id FROM deposit_requests WHERE id=? AND status='pending'", (request_id,)).fetchone()
     if not req:
         await call.message.reply("রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে বা পাওয়া যায়নি।")
         return
     db.execute(
-        """UPDATE deposit_requests SET status='rejected', reviewed_at=%s, reviewed_by=%s
-        WHERE id=%s AND status='pending'""",
+        "UPDATE deposit_requests SET status='rejected', reviewed_at=?, reviewed_by=? WHERE id=? AND status='pending'",
         (int(time.time()), call.from_user.id, request_id),
     )
     with suppress(Exception):
@@ -755,7 +879,7 @@ async def connect_telegram_menu(message: Message, state: FSMContext):
             return
         except Exception:
             await disconnect_client(user_id)
-            db.execute("UPDATE users SET connected=0 WHERE user_id=%s", (user_id,))
+            db.execute("UPDATE users SET connected=0 WHERE user_id=?", (user_id,))
     await state.set_state(StringSessionState.waiting_session)
     await message.answer(
         "🔐 <b>Connect via String Session</b>\n\n"
@@ -794,12 +918,10 @@ async def process_string_session(message: Message, state: FSMContext):
         clients[user_id] = client
         db.execute(
             """INSERT INTO users(user_id,session_string,connected,blocked,created_at)
-            VALUES(%s,%s,1,0,%s)
-            ON CONFLICT(user_id) DO UPDATE SET session_string=EXCLUDED.session_string,
-            connected=1, created_at=EXCLUDED.created_at""",
+            VALUES(?,?,1,0,?)""",
             (user_id, session_string, int(time.time())),
         )
-        db.execute("DELETE FROM user_admin_sessions WHERE user_id=%s", (user_id,))
+        db.execute("DELETE FROM user_admin_sessions WHERE user_id=?", (user_id,))
         await state.clear()
         with suppress(Exception):
             await message.delete()
@@ -845,15 +967,11 @@ async def select_admin_session(call: CallbackQuery):
     await call.answer()
     uid = call.from_user.id
     sid = int(call.data.rsplit("_", 1)[1])
-    row = db.execute("SELECT id, username FROM admin_sessions WHERE id=%s", (sid,)).fetchone()
+    row = db.execute("SELECT id, username FROM admin_sessions WHERE id=?", (sid,)).fetchone()
     if not row:
         await call.message.answer("❌ সেশনটি পাওয়া যায়নি।")
         return
-    db.execute(
-        """INSERT INTO user_admin_sessions(user_id,session_id,created_at) VALUES(%s,%s,%s)
-        ON CONFLICT(user_id) DO UPDATE SET session_id=EXCLUDED.session_id,created_at=EXCLUDED.created_at""",
-        (uid, sid, int(time.time())),
-    )
+    db.execute("INSERT INTO user_admin_sessions(user_id,session_id,created_at) VALUES(?,?,?)", (uid, sid, int(time.time())))
     await disconnect_client(uid)
     await call.message.answer(f"✅ Admin Session নির্বাচিত: @{row['username']}", reply_markup=user_keyboard(uid))
 
@@ -937,12 +1055,10 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
     try:
         client = await ensure_client(uid)
         
-        # Try resolving the entity safely
         entity = None
         try:
             entity = await client.get_entity(username)
         except Exception:
-            # If standard get_entity fails, try joining or importing chat invite if it's an invite link
             if "joinchat" in raw_input or "+" in raw_input:
                 from telethon.tl.functions.messages import ImportChatInviteRequest
                 invite_hash = raw_input.split("/")[-1].replace("+", "")
@@ -959,10 +1075,7 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
         title = getattr(entity, "title", username)
         db.execute(
             """INSERT INTO channels(owner_id,channel_type,channel_username,channel_id,title,active,auto_allow,created_at)
-            VALUES(%s,%s,%s,%s,%s,1,1,%s)
-            ON CONFLICT(owner_id,channel_type) DO UPDATE SET
-            channel_username=EXCLUDED.channel_username,channel_id=EXCLUDED.channel_id,
-            title=EXCLUDED.title,active=1,created_at=EXCLUDED.created_at""",
+            VALUES(?,?,?,?,?,1,1,?)""",
             (uid, channel_type, username, entity.id, title, int(time.time())),
         )
         await state.clear()
@@ -1023,12 +1136,12 @@ async def charge_live_minute(user_id):
     if rate <= 0:
         return True
     try:
-        fresh = db.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,)).fetchone()
+        fresh = db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
         if not fresh or fresh["balance"] < rate:
-            db.execute("UPDATE users SET bot_enabled=0,billing_seconds=0,billing_last_ts=0 WHERE user_id=%s", (user_id,))
+            db.execute("UPDATE users SET bot_enabled=0,billing_seconds=0,billing_last_ts=0 WHERE user_id=?", (user_id,))
             return False
         db.execute(
-            "UPDATE users SET balance=balance-%s, total_spent=total_spent+%s WHERE user_id=%s",
+            "UPDATE users SET balance=balance-?, total_spent=total_spent+? WHERE user_id=?",
             (rate, rate, user_id),
         )
         return True
@@ -1039,22 +1152,19 @@ async def bill_if_live(user_id, is_live):
     u = user_row(user_id)
     now = int(time.time())
     if not u["bot_enabled"] or not is_live or is_blocked(user_id):
-        db.execute(
-            "UPDATE users SET billing_seconds=0, billing_last_ts=0 WHERE user_id=%s",
-            (user_id,),
-        )
+        db.execute("UPDATE users SET billing_seconds=0, billing_last_ts=0 WHERE user_id=?", (user_id,))
         return True
 
     last_ts = int(u["billing_last_ts"] or 0)  
     elapsed = max(0, min(now - last_ts, 2 * 60)) if last_ts else 0  
     seconds = int(u["billing_seconds"] or 0) + elapsed  
-    db.execute("UPDATE users SET billing_last_ts=%s WHERE user_id=%s", (now, user_id))  
+    db.execute("UPDATE users SET billing_last_ts=? WHERE user_id=?", (now, user_id))  
 
     while seconds >= 60:  
         if not await charge_live_minute(user_id):  
             return False  
         seconds -= 60  
-    db.execute("UPDATE users SET billing_seconds=%s WHERE user_id=%s", (seconds, user_id))  
+    db.execute("UPDATE users SET billing_seconds=? WHERE user_id=?", (seconds, user_id))  
     return True
 
 async def monitor_user(user_id):
@@ -1227,7 +1337,7 @@ async def deposits_callback(call: CallbackQuery):
 async def show_deposit_requests(message, actor_id):
     if not is_admin(actor_id):
         return
-    rows = db.execute("SELECT * FROM deposit_requests WHERE status='pending' ORDER BY id ASC LIMIT 20").fetchall()
+    rows = db.execute("SELECT * FROM deposit_requests WHERE status='pending'").fetchall()
     if not rows:
         await message.answer("💰 কোনো Pending Deposit Request নেই।", reply_markup=admin_reply_keyboard())
         return
@@ -1362,16 +1472,13 @@ async def reports_callback(call: CallbackQuery):
 async def show_user_reports(message, actor_id):
     if not is_admin(actor_id):
         return
-    rows = db.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT 100").fetchall()
+    rows = db.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
     if not rows:
         await message.answer("কোনো ইউজার নেই।", reply_markup=admin_reply_keyboard())
         return
-    await message.answer(f"📊 User Report — মোট {len(rows)} জন (সর্বোচ্চ 100 জন):", reply_markup=admin_reply_keyboard())
+    await message.answer(f"📊 User Report — মোট {len(rows)} জন:", reply_markup=admin_reply_keyboard())
     for u in rows:
-        channels = db.execute(
-            "SELECT channel_type, channel_username FROM channels WHERE owner_id=%s AND active=1",
-            (u["user_id"],),
-        ).fetchall()
+        channels = db.execute("SELECT channel_type, channel_username FROM channels WHERE owner_id=? AND active=1", (u["user_id"],)).fetchall()
         channel_text = "\n".join(f"• {c['channel_type']}: {c['channel_username']}" for c in channels) or "কোনো চ্যানেল নেই"
         report = (
             f"👤 <b>User</b>\n🆔 <code>{u['user_id']}</code>\n"
@@ -1409,11 +1516,11 @@ async def search_user_result(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ সঠিক User ID দিন।")
         return
-    u = db.execute("SELECT * FROM users WHERE user_id=%s", (target_id,)).fetchone()
+    u = db.execute("SELECT * FROM users WHERE user_id=?", (target_id,)).fetchone()
     if not u:
         await message.answer("❌ ইউজার পাওয়া যায়নি।", reply_markup=admin_reply_keyboard())
         return
-    channels = db.execute("SELECT channel_type,channel_username,title FROM channels WHERE owner_id=%s", (target_id,)).fetchall()
+    channels = db.execute("SELECT channel_type,channel_username,title FROM channels WHERE owner_id=?", (target_id,)).fetchall()
     ctext = "\n".join(f"• {c['channel_type']}: {c['channel_username']} ({c['title'] or 'Unknown'})" for c in channels) or "কোনো চ্যানেল নেই"
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚫 Block" if not u["blocked"] else "🔓 Unblock",
@@ -1433,7 +1540,7 @@ async def admin_block_user(call: CallbackQuery):
         return
     await call.answer()
     uid = int(call.data.rsplit("_", 1)[1])
-    db.execute("UPDATE users SET blocked=1,bot_enabled=0,billing_seconds=0,billing_last_ts=0 WHERE user_id=%s", (uid,))
+    db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (uid,))
     await disconnect_client(uid)
     await call.message.edit_text(f"🚫 User <code>{uid}</code> ব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
@@ -1444,7 +1551,7 @@ async def admin_unblock_user(call: CallbackQuery):
         return
     await call.answer()
     uid = int(call.data.rsplit("_", 1)[1])
-    db.execute("UPDATE users SET blocked=0 WHERE user_id=%s", (uid,))
+    db.execute("UPDATE users SET blocked=0 WHERE user_id=?", (uid,))
     await call.message.edit_text(f"🔓 User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
 # =========================================================
@@ -1476,15 +1583,15 @@ async def broadcast_send(message: Message, state: FSMContext):
     if not text:
         await message.answer("❌ শুধু Text broadcast সমর্থিত।")
         return
-    rows = db.execute("SELECT user_id FROM users WHERE blocked=0").fetchall()
     success = failed = 0
-    for row in rows:
-        try:
-            await bot.send_message(row["user_id"], text, parse_mode=None)
-            success += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            failed += 1
+    for row in MEM_USERS.values():
+        if row.get("blocked", 0) == 0:
+            try:
+                await bot.send_message(row["user_id"], text, parse_mode=None)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
     await message.answer(f"📢 Broadcast Complete\nসফল: {success}\nব্যর্থ: {failed}", reply_markup=admin_reply_keyboard())
 
 @router.message(F.text == "🧩 Manage Admin Session")
@@ -1551,10 +1658,7 @@ async def admin_add_session_save(message: Message, state: FSMContext):
             return
         me = await test_client.get_me()
         username = (me.username or username).lstrip("@")
-        db.execute(
-            "INSERT INTO admin_sessions(username,session_string,added_at) VALUES(%s,%s,%s)",
-            (username, message.text.strip(), int(time.time())),
-        )
+        db.execute("INSERT INTO admin_sessions(username,session_string,added_at) VALUES(?,?,?)", (username, message.text.strip(), int(time.time())))
         await state.clear()
         with suppress(Exception):
             await message.delete()
@@ -1587,8 +1691,8 @@ async def admin_delete_session(call: CallbackQuery):
         return
     await call.answer()
     sid = int(call.data.rsplit("_", 1)[1])
-    db.execute("DELETE FROM admin_sessions WHERE id=%s", (sid,))
-    db.execute("DELETE FROM user_admin_sessions WHERE session_id=%s", (sid,))
+    db.execute("DELETE FROM admin_sessions WHERE id=?", (sid,))
+    db.execute("DELETE FROM user_admin_sessions WHERE session_id=?", (sid,))
     for uid in list(clients.keys()):
         if not is_connected_user(uid) and not has_admin_session(uid):
             await disconnect_client(uid)
@@ -1600,10 +1704,7 @@ async def admin_view_sess_users(call: CallbackQuery):
         await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    rows = db.execute(
-        """SELECT uas.user_id, a.username FROM user_admin_sessions uas
-        JOIN admin_sessions a ON a.id=uas.session_id ORDER BY uas.user_id"""
-    ).fetchall()
+    rows = db.execute("SELECT uas.user_id, a.username FROM user_admin_sessions uas JOIN admin_sessions a ON a.id=uas.session_id").fetchall()
     text = "👥 <b>Admin Session ব্যবহারকারী</b>\n\n"
     text += "\n".join(f"• <code>{r['user_id']}</code> — @{r['username']}" for r in rows) if rows else "কেউ ব্যবহার করছে না।"
     await call.message.answer(text, parse_mode="HTML", reply_markup=admin_inline_keyboard())
