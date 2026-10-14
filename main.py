@@ -24,9 +24,11 @@ from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
+=========================================================
+
+CONFIGURATION
+
+=========================================================
 
 load_dotenv()
 
@@ -58,10 +60,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AutoSpeaker")
 
-# =========================================================
-# DATABASE (PostgreSQL / Neon DB)
-# =========================================================
+=========================================================
 
+DATABASE (PostgreSQL / Neon DB)
+
+=========================================================
+
+# Synchronous connection for helper functions/startup setup using psycopg2
 db = psycopg2.connect(DATABASE_URL)
 db.autocommit = True
 db_lock = asyncio.Lock()
@@ -217,9 +222,11 @@ def has_admin_session(user_id):
         )
         return cur.fetchone() is not None
 
-# =========================================================
-# BOT / TELETHON CLIENTS
-# =========================================================
+=========================================================
+
+BOT / TELETHON CLIENTS
+
+=========================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -279,9 +286,11 @@ async def disconnect_client(user_id):
             if client.is_connected():
                 await client.disconnect()
 
-# =========================================================
-# STATES
-# =========================================================
+=========================================================
+
+STATES
+
+=========================================================
 
 class StringSessionState(StatesGroup):
     waiting_session = State()
@@ -312,9 +321,11 @@ class DepositSettingState(StatesGroup):
     waiting_minimum = State()
     waiting_charge = State()
 
-# =========================================================
-# KEYBOARDS
-# =========================================================
+=========================================================
+
+KEYBOARDS
+
+=========================================================
 
 def user_keyboard(user_id):
     rows = [
@@ -376,9 +387,11 @@ def deposit_review_keyboard(request_id):
 def admin_only(user_id):
     return is_admin(user_id)
 
-# =========================================================
-# START / MENUS
-# =========================================================
+=========================================================
+
+START / MENUS
+
+=========================================================
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
@@ -444,9 +457,11 @@ async def main_menu_back(call: CallbackQuery, state: FSMContext):
     await call.message.answer("👇 User Main Menu", reply_markup=user_keyboard(uid))
     await call.message.answer("Control Panel:", reply_markup=main_menu_inline(uid))
 
-# =========================================================
-# PROFILE / BOT TOGGLE / TOP-UP
-# =========================================================
+=========================================================
+
+PROFILE / BOT TOGGLE / TOP-UP
+
+=========================================================
 
 def profile_text(user_id):
     u = user_row(user_id)
@@ -660,9 +675,11 @@ async def deposit_reject(call: CallbackQuery):
         await bot.send_message(user_id, f"❌ আপনার Deposit #{request_id} Reject করা হয়েছে। প্রয়োজনে অ্যাডমিনের সঙ্গে যোগাযোগ করুন।")
     await call.message.edit_caption(caption=f"❌ Deposit #{request_id} REJECTED", reply_markup=None)
 
-# =========================================================
-# HELP / TELEGRAM SESSION CONNECTION
-# =========================================================
+=========================================================
+
+HELP / TELEGRAM SESSION CONNECTION
+
+=========================================================
 
 async def send_help(message: Message):
     await message.answer(
@@ -772,9 +789,11 @@ async def process_string_session(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID ও API_HASH যাচাই করুন।")
 
-# =========================================================
-# ADMIN SESSION SELECTOR (legacy feature)
-# =========================================================
+=========================================================
+
+ADMIN SESSION SELECTOR (legacy feature)
+
+=========================================================
 
 @router.message(F.text == "🤖 Admin Session")
 async def admin_session_text_handler(message: Message):
@@ -819,9 +838,11 @@ async def select_admin_session(call: CallbackQuery):
     await disconnect_client(uid)
     await call.message.answer(f"✅ Admin Session নির্বাচিত: @{row[1]}", reply_markup=user_keyboard(uid))
 
-# =========================================================
-# TARGET / LIVE CHANNEL SETUP
-# =========================================================
+=========================================================
+
+TARGET / LIVE CHANNEL SETUP
+
+=========================================================
 
 @router.message(F.text == "🎯 Target Channel")
 async def target_text_handler(message: Message, state: FSMContext):
@@ -923,9 +944,11 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
         await state.clear()
         await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
 
-# =========================================================
-# LIVE CALL HELPERS (Optimized & Limit Increased)
-# =========================================================
+=========================================================
+
+LIVE CALL HELPERS (Optimized & Limit Increased)
+
+=========================================================
 
 async def get_active_call(client, channel_username):
     entity = await client.get_entity(channel_username)
@@ -934,6 +957,7 @@ async def get_active_call(client, channel_username):
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
+    # limit বাড়িয়ে ৩০০ করা হলো যাতে ২০০+ লোক এক সাথে পারমিশন পেতে পারে
     result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=300))
     users = {user.id: user for user in getattr(result, "users", [])}
     return list(getattr(result, "participants", [])), users
@@ -959,9 +983,11 @@ async def allow_participant(client, call, user):
         call=input_call, participant=input_user, muted=False
     ))
 
-# =========================================================
-# LIVE BILLING + MONITOR
-# =========================================================
+=========================================================
+
+LIVE BILLING + MONITOR
+
+=========================================================
 
 async def charge_live_minute(user_id):
     rate = max(0, int(float(setting("coins_per_minute"))))
@@ -1037,6 +1063,7 @@ async def monitor_user(user_id):
             target_entity = await client.get_entity(target_row["channel_username"])
             participants, users = await get_participants(client, call)
             
+            # গতি বাড়ানোর জন্য একসাথে অনেকগুলো আনমিউট রিকোয়েস্ট (Concurrency) প্রসেস করা হচ্ছে
             async def process_participant(participant):
                 peer = getattr(participant, "peer", None)
                 if not isinstance(peer, types.PeerUser):
@@ -1063,6 +1090,7 @@ async def monitor_user(user_id):
                 except Exception:
                     logger.exception("Could not unmute participant %s", uid)
 
+            # ২০০ জন পর্যন্ত মেম্বার একসাথে ফাস্ট প্রসেস করার জন্য asyncio.gather ব্যবহার করা হলো
             tasks = [process_participant(p) for p in participants]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -1160,9 +1188,11 @@ async def live_status_message(message: Message):
         logger.exception("Status check failed for user %s", uid)
         await message.answer("❌ Status পাওয়া যায়নি। Session, channel access ও live call যাচাই করুন।")
 
-# =========================================================
-# ADMIN: DEPOSIT REQUESTS / SETTINGS / REPORTS
-# =========================================================
+=========================================================
+
+ADMIN: DEPOSIT REQUESTS / SETTINGS / REPORTS
+
+=========================================================
 
 @router.message(F.text == "💰 Deposit Requests")
 async def deposits_text(message: Message):
@@ -1413,9 +1443,11 @@ async def admin_unblock_user(call: CallbackQuery):
         cur.execute("UPDATE users SET blocked=0 WHERE user_id=%s", (uid,))
     await call.message.edit_text(f"🔓 User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
-# =========================================================
-# BROADCAST / MANAGE ADMIN SESSIONS
-# =========================================================
+=========================================================
+
+BROADCAST / MANAGE ADMIN SESSIONS
+
+=========================================================
 
 @router.message(F.text == "📢 Broadcast Message")
 async def broadcast_text(message: Message, state: FSMContext):
@@ -1584,9 +1616,11 @@ async def admin_view_sess_users(call: CallbackQuery):
     text += "\n".join(f"• <code>{r[0]}</code> — @{r[1]}" for r in rows) if rows else "কেউ ব্যবহার করছে না।"
     await call.message.answer(text, parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
-# =========================================================
-# WEB SERVER / KEEP-ALIVE
-# =========================================================
+=========================================================
+
+WEB SERVER / KEEP-ALIVE
+
+=========================================================
 
 web_app = Flask(__name__)
 
@@ -1614,9 +1648,11 @@ def keep_alive():
     if os.environ.get("RENDER_EXTERNAL_URL", "").strip():
         Thread(target=ping_self, daemon=True).start()
 
-# =========================================================
-# MAIN
-# =========================================================
+=========================================================
+
+MAIN
+
+=========================================================
 
 async def main():
     logger.info("Telegram Auto Speaker starting...")
