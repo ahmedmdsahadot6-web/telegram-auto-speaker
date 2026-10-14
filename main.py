@@ -2,24 +2,19 @@ import os
 import time
 import asyncio
 import logging
-import sqlite3
+import asyncpg
+import psycopg2
 from contextlib import suppress
 from threading import Thread
 
 from dotenv import load_dotenv
-from aiohttp import web as aiohttp_web
 from flask import Flask
 import requests
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InputMediaPhoto,
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 )
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
@@ -29,162 +24,264 @@ from telethon import TelegramClient, functions, types
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, RPCError
 
-=========================================================
-CONFIGURATION
-=========================================================
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_HASH = os.getenv("API_HASH", "").strip()
-
 try:
     API_ID = int(os.getenv("API_ID", "0"))
 except ValueError:
     API_ID = 0
 
 PORT = int(os.getenv("PORT", "10000"))
-DB_FILE = os.getenv("DB_FILE", "speaker_manager.db")
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://neondb_owner:npg_R4bY0VBzyLql@ep-bold-bonus-ayev740j-pooler.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+).strip()
 MONITOR_INTERVAL = max(3, int(os.getenv("MONITOR_INTERVAL", "5")))
-
 ADMIN_IDS = [7871224176, 8454401183]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing in environment variables")
-
 if not API_ID:
     raise RuntimeError("API_ID missing in environment variables")
-
 if not API_HASH:
     raise RuntimeError("API_HASH missing in environment variables")
-
-=========================================================
-LOGGING
-=========================================================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 logger = logging.getLogger("AutoSpeaker")
 
-=========================================================
-DATABASE
-=========================================================
+# =========================================================
+# DATABASE (PostgreSQL / Neon DB)
+# =========================================================
 
-db = sqlite3.connect(
-    DB_FILE,
-    check_same_thread=False,
-)
+db = psycopg2.connect(DATABASE_URL)
+db.autocommit = True
+db_lock = asyncio.Lock()
 
-db.row_factory = sqlite3.Row
+def column_exists(table, column):
+    with db.cursor() as cur:
+        cur.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name='{table}' AND column_name='{column}'")
+        return cur.fetchone() is not None
 
 def init_db():
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        session_string TEXT,
-        connected INTEGER DEFAULT 0,
-        blocked INTEGER DEFAULT 0,
-        balance REAL DEFAULT 0.0,
-        total_spent REAL DEFAULT 0.0,
-        bot_active INTEGER DEFAULT 1,
-        created_at INTEGER
-    )
-    """)
+    with db.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                session_string TEXT,
+                connected INTEGER DEFAULT 0,
+                blocked INTEGER DEFAULT 0,
+                created_at BIGINT,
+                balance BIGINT NOT NULL DEFAULT 0,
+                total_spent BIGINT NOT NULL DEFAULT 0,
+                bot_enabled INTEGER NOT NULL DEFAULT 0,
+                billing_seconds BIGINT NOT NULL DEFAULT 0,
+                billing_last_ts BIGINT NOT NULL DEFAULT 0
+            )
+        """)
+        for col, definition in (
+            ("balance", "BIGINT NOT NULL DEFAULT 0"),
+            ("total_spent", "BIGINT NOT NULL DEFAULT 0"),
+            ("bot_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("billing_seconds", "BIGINT NOT NULL DEFAULT 0"),
+            ("billing_last_ts", "BIGINT NOT NULL DEFAULT 0"),
+        ):
+            if not column_exists("users", col):
+                cur.execute(f"ALTER TABLE users ADD COLUMN {col} {definition}")
 
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS channels (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        owner_id INTEGER NOT NULL,
-        channel_type TEXT NOT NULL,
-        channel_username TEXT NOT NULL,
-        channel_id INTEGER,
-        title TEXT,
-        active INTEGER DEFAULT 1,
-        auto_allow INTEGER DEFAULT 1,
-        created_at INTEGER,
-        UNIQUE(owner_id, channel_type)
-    )
-    """)
-
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS admin_sessions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
-        session_string TEXT NOT NULL,
-        added_at INTEGER
-    )
-    """)
-
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS user_admin_sessions (
-        user_id INTEGER PRIMARY KEY,
-        session_id INTEGER,
-        created_at INTEGER
-    )
-    """)
-
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS deposits (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount_usd REAL NOT NULL,
-        coins REAL NOT NULL,
-        screenshot_file_id TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at INTEGER
-    )
-    """)
-
-    db.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
-
-    # Default Settings
-    default_settings = {
-        "binance_pay_id": "839892941",
-        "rate_per_usd": "65000",
-        "min_deposit": "1",
-        "cost_per_minute": "100"  # প্রতি মিনিটে কত কয়েন কাটবে
-    }
-
-    for k, v in default_settings.items():
-        db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-
-    db.commit()
+        cur.execute("""  
+            CREATE TABLE IF NOT EXISTS channels (  
+                id SERIAL PRIMARY KEY,  
+                owner_id BIGINT NOT NULL,  
+                channel_type TEXT NOT NULL,  
+                channel_username TEXT NOT NULL,  
+                channel_id BIGINT,  
+                title TEXT,  
+                active INTEGER DEFAULT 1,  
+                auto_allow INTEGER DEFAULT 1,  
+                created_at BIGINT,  
+                UNIQUE(owner_id, channel_type)  
+            )  
+        """)  
+        cur.execute("""  
+            CREATE TABLE IF NOT EXISTS admin_sessions (  
+                id SERIAL PRIMARY KEY,  
+                username TEXT NOT NULL,  
+                session_string TEXT NOT NULL,  
+                added_at BIGINT  
+            )  
+        """)  
+        cur.execute("""  
+            CREATE TABLE IF NOT EXISTS user_admin_sessions (  
+                user_id BIGINT PRIMARY KEY,  
+                session_id INTEGER,  
+                created_at BIGINT  
+            )  
+        """)  
+        cur.execute("""  
+            CREATE TABLE IF NOT EXISTS deposit_requests (  
+                id SERIAL PRIMARY KEY,  
+                user_id BIGINT NOT NULL,  
+                amount_usd REAL NOT NULL,  
+                coins BIGINT NOT NULL,  
+                photo_file_id TEXT NOT NULL,  
+                status TEXT NOT NULL DEFAULT 'pending',  
+                created_at BIGINT NOT NULL,  
+                reviewed_at BIGINT,  
+                reviewed_by BIGINT  
+            )  
+        """)  
+        cur.execute("""  
+            CREATE TABLE IF NOT EXISTS settings (  
+                key TEXT PRIMARY KEY,  
+                value TEXT NOT NULL  
+            )  
+        """)  
+        defaults = {  
+            "binance_pay_id": "839892941",  
+            "coins_per_dollar": "65000",  
+            "min_deposit_usd": "1",  
+            "coins_per_minute": "1000",  
+        }  
+        for key, value in defaults.items():  
+            cur.execute("INSERT INTO settings(key, value) VALUES (%s, %s) ON CONFLICT (key) DO NOTHING", (key, value))
 
 init_db()
 
-def get_setting(key):
-    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else ""
+def setting(key):
+    with db.cursor() as cur:
+        cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+        row = cur.fetchone()
+        return row[0] if row else ""
 
-def update_setting(key, value):
-    db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
-    db.commit()
+def set_setting(key, value):
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO settings(key,value) VALUES(%s,%s) "
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+            (key, str(value)),
+        )
 
-=========================================================
-BOT INITIALIZATION
-=========================================================
+def ensure_user(user_id):
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users(user_id, connected, blocked, created_at) VALUES(%s,0,0,%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id, int(time.time())),
+        )
+
+def user_row(user_id):
+    ensure_user(user_id)
+    with db.cursor() as cur:
+        cur.execute("SELECT user_id, session_string, connected, blocked, created_at, balance, total_spent, bot_enabled, billing_seconds, billing_last_ts FROM users WHERE user_id=%s", (user_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = ["user_id", "session_string", "connected", "blocked", "created_at", "balance", "total_spent", "bot_enabled", "billing_seconds", "billing_last_ts"]
+        return {cols[i]: row[i] for i in range(len(cols))}
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+def is_blocked(user_id):
+    row = user_row(user_id)
+    return bool(row["blocked"]) if row else False
+
+def is_connected_user(user_id):
+    row = user_row(user_id)
+    return bool(row["connected"]) and not bool(row["blocked"]) if row else False
+
+def get_channel(owner_id, channel_type):
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT id, owner_id, channel_type, channel_username, channel_id, title, active, auto_allow, created_at FROM channels WHERE owner_id=%s AND channel_type=%s AND active=1",
+            (owner_id, channel_type),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        cols = ["id", "owner_id", "channel_type", "channel_username", "channel_id", "title", "active", "auto_allow", "created_at"]
+        return {cols[i]: row[i] for i in range(len(cols))}
+
+def has_admin_session(user_id):
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM user_admin_sessions WHERE user_id=%s", (user_id,)
+        )
+        return cur.fetchone() is not None
+
+# =========================================================
+# BOT / TELETHON CLIENTS
+# =========================================================
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-
 dp.include_router(router)
 
 clients = {}
 client_locks = {}
 monitor_locks = {}
 
-=========================================================
-STATES
-=========================================================
+def get_lock(lock_map, user_id):
+    if user_id not in lock_map:
+        lock_map[user_id] = asyncio.Lock()
+    return lock_map[user_id]
+
+def get_client(user_id):
+    if user_id not in clients:
+        with db.cursor() as cur:
+            cur.execute(
+                """SELECT session_string FROM admin_sessions
+                JOIN user_admin_sessions ON admin_sessions.id=user_admin_sessions.session_id
+                WHERE user_admin_sessions.user_id=%s""",
+                (user_id,),
+            )
+            us_row = cur.fetchone()
+            if us_row and us_row[0]:
+                session_string = us_row[0]
+            else:
+                cur.execute(
+                    "SELECT session_string FROM users WHERE user_id=%s AND connected=1",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                session_string = row[0] if row and row[0] else ""
+
+        clients[user_id] = TelegramClient(  
+            StringSession(session_string), API_ID, API_HASH,  
+            device_model="Telegram Auto Speaker",  
+            system_version="Python", app_version="1.0",  
+            connection_retries=5, timeout=30, auto_reconnect=True,  
+        )  
+    return clients[user_id]
+
+async def ensure_client(user_id):
+    client = get_client(user_id)
+    async with get_lock(client_locks, user_id):
+        if not client.is_connected():
+            await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram session invalid. Connect Telegram again.")
+        return client
+
+async def disconnect_client(user_id):
+    client = clients.pop(user_id, None)
+    if client:
+        with suppress(Exception):
+            if client.is_connected():
+                await client.disconnect()
+
+# =========================================================
+# STATES
+# =========================================================
 
 class StringSessionState(StatesGroup):
     waiting_session = State()
@@ -207,266 +304,377 @@ class SearchUserState(StatesGroup):
 
 class DepositState(StatesGroup):
     waiting_amount = State()
-    waiting_screenshot = State()
+    waiting_photo = State()
 
-class EditSettingsState(StatesGroup):
-    waiting_value = State()
+class DepositSettingState(StatesGroup):
+    waiting_pay_id = State()
+    waiting_rate = State()
+    waiting_minimum = State()
+    waiting_charge = State()
 
-=========================================================
-LOCKS
-=========================================================
+# =========================================================
+# KEYBOARDS
+# =========================================================
 
-def get_lock(lock_map, user_id):
-    if user_id not in lock_map:
-        lock_map[user_id] = asyncio.Lock()
-    return lock_map[user_id]
-
-=========================================================
-KEYBOARDS
-=========================================================
-
-def main_keyboard(user_id=None):
-    kb = [
-        [
-            KeyboardButton(text="🔐 Connect Telegram"),
-            KeyboardButton(text="🎯 Target Channel"),
-        ],
-        [
-            KeyboardButton(text="📺 Live Stream Channel"),
-            KeyboardButton(text="📊 Live Status"),
-        ],
-        [
-            KeyboardButton(text="💰 Top-up"),
-            KeyboardButton(text="👤 Profile"),
-        ],
-        [
-            KeyboardButton(text="🤖 Admin Session"),
-            KeyboardButton(text="ℹ️ Help"),
-        ],
+def user_keyboard(user_id):
+    rows = [
+        [KeyboardButton(text="💰 Top-up"), KeyboardButton(text="👤 Profile")],
+        [KeyboardButton(text="⏯️ Bot ON/OFF"), KeyboardButton(text="🔐 Connect Telegram")],
+        [KeyboardButton(text="🎯 Target Channel"), KeyboardButton(text="📺 Live Stream Channel")],
+        [KeyboardButton(text="📊 Live Status"), KeyboardButton(text="🤖 Admin Session")],
+        [KeyboardButton(text="ℹ️ Help")],
     ]
-    if user_id in ADMIN_IDS:
-        kb.append([KeyboardButton(text="👑 Admin Panel")])
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="👑 Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
+def admin_reply_keyboard():
     return ReplyKeyboardMarkup(
-        keyboard=kb,
+        keyboard=[
+            [KeyboardButton(text="💰 Deposit Requests"), KeyboardButton(text="📊 User Reports")],
+            [KeyboardButton(text="⚙️ Deposit Settings"), KeyboardButton(text="🔍 Search User")],
+            [KeyboardButton(text="📢 Broadcast Message"), KeyboardButton(text="🧩 Manage Admin Session")],
+            [KeyboardButton(text="🔙 Main Menu")],
+        ],
         resize_keyboard=True,
         is_persistent=True,
     )
 
-def admin_keyboard():
-    kb = [
-        [
-            KeyboardButton(text="📢 Broadcast Message"),
-            KeyboardButton(text="🔍 Search User"),
-        ],
-        [
-            KeyboardButton(text="📋 User Reports"),
-            KeyboardButton(text="⚙️ Manage Settings"),
-        ],
-        [
-            KeyboardButton(text="⚙️ Manage Admin Session"),
-            KeyboardButton(text="🔙 Main Menu"),
-        ],
-    ]
-    return ReplyKeyboardMarkup(
-        keyboard=kb,
-        resize_keyboard=True,
-        is_persistent=True,
-    )
-
-def main_menu(user_id=None):
-    inline_kb = [
+def main_menu_inline(user_id):
+    rows = [
+        [InlineKeyboardButton(text="💰 Top-up", callback_data="topup")],
+        [InlineKeyboardButton(text="👤 Profile", callback_data="profile")],
+        [InlineKeyboardButton(text="⏯️ Bot ON/OFF", callback_data="bot_toggle")],
         [InlineKeyboardButton(text="🔐 Connect Telegram", callback_data="connect")],
         [InlineKeyboardButton(text="🎯 Target Channel", callback_data="target")],
         [InlineKeyboardButton(text="📺 Live Stream Channel", callback_data="live")],
         [InlineKeyboardButton(text="📊 Live Status", callback_data="status")],
-        [InlineKeyboardButton(text="💰 Top-up", callback_data="topup")],
-        [InlineKeyboardButton(text="👤 Profile", callback_data="profile")],
         [InlineKeyboardButton(text="🤖 Admin Session", callback_data="admin_session_menu")],
         [InlineKeyboardButton(text="ℹ️ Help", callback_data="help")],
     ]
-    if user_id in ADMIN_IDS:
-        inline_kb.append([InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel_kb")])
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton(text="👑 Admin Panel", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    return InlineKeyboardMarkup(inline_keyboard=inline_kb)
+def admin_inline_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Deposit Requests", callback_data="admin_deposits")],
+        [InlineKeyboardButton(text="📊 User Reports", callback_data="admin_reports")],
+        [InlineKeyboardButton(text="⚙️ Deposit Settings", callback_data="admin_settings")],
+        [InlineKeyboardButton(text="🔍 Search User", callback_data="admin_search")],
+        [InlineKeyboardButton(text="📢 Broadcast Message", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🧩 Manage Admin Session", callback_data="admin_manage_session")],
+        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu_back")],
+    ])
 
-=========================================================
-DATABASE HELPERS
-=========================================================
+def deposit_review_keyboard(request_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Accept", callback_data=f"dep_accept_{request_id}"),
+        InlineKeyboardButton(text="❌ Reject", callback_data=f"dep_reject_{request_id}"),
+    ]])
 
-def is_connected_user(user_id):
-    row = db.execute(
-        "SELECT connected, blocked FROM users WHERE user_id=?",
-        (user_id,),
-    ).fetchone()
+def admin_only(user_id):
+    return is_admin(user_id)
 
-    if row and row["blocked"]:
-        return False
-    return bool(row and row["connected"])
-
-def get_channel(owner_id, channel_type):
-    return db.execute(
-        """
-        SELECT *
-        FROM channels
-        WHERE owner_id=?
-        AND channel_type=?
-        AND active=1
-        """,
-        (owner_id, channel_type),
-    ).fetchone()
-
-=========================================================
-TELETHON CLIENT
-=========================================================
-
-def get_client(user_id):
-    if user_id not in clients:
-        us_row = db.execute(
-            "SELECT session_string FROM admin_sessions JOIN user_admin_sessions ON admin_sessions.id = user_admin_sessions.session_id WHERE user_admin_sessions.user_id=?",
-            (user_id,)
-        ).fetchone()
-
-        if us_row and us_row["session_string"]:
-            session_string = us_row["session_string"]
-        else:
-            row = db.execute(
-                """
-                SELECT session_string
-                FROM users
-                WHERE user_id=?
-                AND connected=1
-                """,
-                (user_id,),
-            ).fetchone()
-
-            session_string = (
-                row["session_string"]
-                if row and row["session_string"]
-                else ""
-            )
-
-        clients[user_id] = TelegramClient(
-            StringSession(session_string),
-            API_ID,
-            API_HASH,
-            device_model="Telegram Auto Speaker",
-            system_version="Python",
-            app_version="1.0",
-            connection_retries=5,
-            timeout=30,
-            auto_reconnect=True,
-        )
-
-    return clients[user_id]
-
-async def ensure_client(user_id):
-    client = get_client(user_id)
-
-    async with get_lock(client_locks, user_id):
-        if not client.is_connected():
-            await client.connect()
-
-        if not await client.is_user_authorized():
-            raise RuntimeError(
-                "Telegram session invalid. Connect Telegram again."
-            )
-
-    return client
-
-async def disconnect_client(user_id):
-    client = clients.pop(user_id, None)
-
-    if client:
-        with suppress(Exception):
-            if client.is_connected():
-                await client.disconnect()
-
-=========================================================
-START
-=========================================================
+# =========================================================
+# START / MENUS
+# =========================================================
 
 @router.message(CommandStart())
 async def start_handler(message: Message):
     user_id = message.chat.id
-    db.execute(
-        "INSERT OR IGNORE INTO users (user_id, connected, blocked, balance, total_spent, bot_active, created_at) VALUES (?, 0, 0, 0.0, 0.0, 1, ?)",
-        (user_id, int(time.time()))
-    )
-    db.commit()
-
+    ensure_user(user_id)
+    if is_blocked(user_id):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    row = user_row(user_id)
     await message.answer(
         "🎙 <b>TELEGRAM AUTO SPEAKER</b>\n\n"
-        "Target Channel-এর সদস্যরা তোমার Live Stream Channel-এর "
-        "লাইভ কলে যোগ দিলে বট তাদের শনাক্ত করার চেষ্টা করবে। "
-        "প্রয়োজনীয় Telegram permission থাকলে muted সদস্যকে "
-        "unmute করার অনুরোধ পাঠাবে।\n\n"
-        "প্রথমে 🔐 Connect Telegram করো অথবা 🤖 Admin Session ব্যবহার করো।",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(user_id),
+        "Target Channel-এর সদস্যরা Live Stream Channel-এর লাইভ কলে যোগ দিলে "
+        "বট তাদের শনাক্ত করার চেষ্টা করবে। প্রয়োজনীয় Telegram permission থাকলে "
+        "muted সদস্যকে unmute করার অনুরোধ পাঠাবে।\n\n"
+        f"💎 Balance: {row['balance']} coins",
+        parse_mode="HTML", reply_markup=user_keyboard(user_id),
     )
+    await message.answer("👇 Control Panel:", reply_markup=main_menu_inline(user_id))
 
-    await message.answer(
-        "👇 Control Panel:",
-        reply_markup=main_menu(user_id),
-    )
+@router.message(F.text == "👑 Admin Panel")
+async def admin_panel_text(message: Message):
+    if not admin_only(message.chat.id):
+        return
+    await show_admin_panel(message)
 
-@router.message(F.text == "🔙 Main Menu")
-async def main_menu_text_back(message: Message):
-    user_id = message.chat.id
-    await message.answer(
-        "👇 Control Panel:",
-        reply_markup=main_keyboard(user_id),
-    )
-    await message.answer(
-        "Main Menu:",
-        reply_markup=main_menu(user_id),
-    )
-
-@router.callback_query(F.data == "main_menu_back")
-async def main_menu_back(call: CallbackQuery):
-    await call.answer()
-    user_id = call.message.chat.id
-    await call.message.answer(
-        "👇 Control Panel:",
-        reply_markup=main_keyboard(user_id),
-    )
-    await call.message.edit_text(
-        "👇 Control Panel:",
-        reply_markup=main_menu(user_id),
-    )
-
-@router.callback_query(F.data == "admin_panel_kb")
-async def admin_panel_kb_callback(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
-        await call.answer("Access Denied!", show_alert=True)
+@router.callback_query(F.data == "admin_panel")
+async def admin_panel_cb(call: CallbackQuery):
+    if not admin_only(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    await call.message.answer(
-        "👑 Admin Keyboard Activated:",
-        reply_markup=admin_keyboard(),
-    )
     await show_admin_panel(call.message)
 
-=========================================================
-HELP
-=========================================================
+async def show_admin_panel(message: Message):
+    with db.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM users")
+        total_users = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM deposit_requests WHERE status='pending'")
+        pending = cur.fetchone()[0]
+    text = (
+        "👑 <b>ADMIN PANEL</b>\n\n"
+        f"👥 Total Users: {total_users}\n"
+        f"💰 Pending Deposits: {pending}\n\n"
+        "নিচের কিবোর্ড থেকে অপশন নির্বাচন করুন।"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=admin_reply_keyboard())
+    await message.answer("Admin Control Panel:", reply_markup=admin_inline_keyboard())
+
+@router.message(F.text == "🔙 Main Menu")
+async def main_menu_reply(message: Message, state: FSMContext):
+    await state.clear()
+    if is_blocked(message.chat.id):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    await message.answer("👇 User Main Menu", reply_markup=user_keyboard(message.chat.id))
+    await message.answer("Control Panel:", reply_markup=main_menu_inline(message.chat.id))
+
+@router.callback_query(F.data == "main_menu_back")
+async def main_menu_back(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.clear()
+    uid = call.from_user.id
+    await call.message.answer("👇 User Main Menu", reply_markup=user_keyboard(uid))
+    await call.message.answer("Control Panel:", reply_markup=main_menu_inline(uid))
+
+# =========================================================
+# PROFILE / BOT TOGGLE / TOP-UP
+# =========================================================
+
+def profile_text(user_id):
+    u = user_row(user_id)
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT channel_type, title, channel_username FROM channels WHERE owner_id=%s AND active=1",
+            (user_id,),
+        )
+        channels = cur.fetchall()
+    channel_text = "\n".join(
+        f"• {c[0].upper()}: {c[1] or 'Unknown'} ({c[2]})"
+        for c in channels
+    ) or "কোনো চ্যানেল সেট করা হয়নি।"
+    return (
+        "👤 <b>আপনার প্রোফাইল</b>\n\n"
+        f"🆔 User ID: <code>{user_id}</code>\n"
+        f"🎯/📺 Channels:\n{channel_text}\n\n"
+        f"💎 Balance: <b>{u['balance']:,} coins</b>\n"
+        f"🔥 Total Spent: <b>{u['total_spent']:,} coins</b>\n"
+        f"⏯️ Bot: {'🟢 ON' if u['bot_enabled'] else '🔴 OFF'}"
+    )
+
+@router.message(F.text == "👤 Profile")
+async def profile_message(message: Message):
+    if is_blocked(message.chat.id):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    await message.answer(profile_text(message.chat.id), parse_mode="HTML", reply_markup=user_keyboard(message.chat.id))
+
+@router.callback_query(F.data == "profile")
+async def profile_callback(call: CallbackQuery):
+    await call.answer()
+    if is_blocked(call.from_user.id):
+        await call.message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    await call.message.answer(profile_text(call.from_user.id), parse_mode="HTML", reply_markup=user_keyboard(call.from_user.id))
+
+async def toggle_bot(user_id, message):
+    if is_blocked(user_id):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    u = user_row(user_id)
+    new_value = 0 if u["bot_enabled"] else 1
+    if new_value:
+        if not get_channel(user_id, "target") or not get_channel(user_id, "live"):
+            await message.answer("❌ আগে Target Channel এবং Live Stream Channel সেট করুন।")
+            return
+        if u["balance"] <= 0:
+            await message.answer("❌ আপনার Coin Balance নেই। প্রথমে 💰 Top-up করুন।")
+            return
+    with db.cursor() as cur:
+        cur.execute("UPDATE users SET bot_enabled=%s, billing_seconds=0, billing_last_ts=0 WHERE user_id=%s", (new_value, user_id))
+    await message.answer(
+        f"{'🟢 Bot ON করা হয়েছে' if new_value else '🔴 Bot OFF করা হয়েছে'}.\n"
+        "শুধু লাইভ চালু থাকলেই চার্জ কাটা হবে।",
+        reply_markup=user_keyboard(user_id),
+    )
+
+@router.message(F.text == "⏯️ Bot ON/OFF")
+async def bot_toggle_message(message: Message):
+    await toggle_bot(message.chat.id, message)
+
+@router.callback_query(F.data == "bot_toggle")
+async def bot_toggle_callback(call: CallbackQuery):
+    await call.answer()
+    await toggle_bot(call.from_user.id, call.message)
+
+async def start_topup(message: Message, state: FSMContext):
+    uid = message.chat.id
+    if is_blocked(uid):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
+    u = user_row(uid)
+    await state.set_state(DepositState.waiting_amount)
+    await message.answer(
+        "💰 <b>Top-up</b>\n\n"
+        f"💎 আপনার বর্তমান ব্যালেন্স: {u['balance']:,} coins\n"
+        f"💵 রেট: $1 = {int(setting('coins_per_dollar')):,} Coins\n\n"
+        f"🟡 Binance Pay ID: <code>{setting('binance_pay_id')}</code>\n\n"
+        f"👉 ধাপ ১: কত ডলার ডিপোজিট করেছেন তা লিখুন (সর্বনিম্ন ${setting('min_deposit_usd')}):",
+        parse_mode="HTML",
+    )
+
+@router.message(F.text == "💰 Top-up")
+async def topup_message(message: Message, state: FSMContext):
+    await start_topup(message, state)
+
+@router.callback_query(F.data == "topup")
+async def topup_callback(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await start_topup(call.message, state)
+
+@router.message(DepositState.waiting_amount)
+async def deposit_amount(message: Message, state: FSMContext):
+    try:
+        amount = float((message.text or "").strip())
+        if amount <= 0 or amount > 1000000:
+            raise ValueError
+    except (ValueError, TypeError):
+        await message.answer("❌ সঠিক ডলারের পরিমাণ লিখুন, যেমন 1, 5 বা 10।")
+        return
+    minimum = float(setting("min_deposit_usd"))
+    if amount < minimum:
+        await message.answer(f"❌ সর্বনিম্ন ডিপোজিট ${minimum:g}।")
+        return
+    coins = int(round(amount * int(setting("coins_per_dollar"))))
+    await state.update_data(deposit_amount=amount, deposit_coins=coins)
+    await state.set_state(DepositState.waiting_photo)
+    await message.answer(
+        f"💰 আপনার ডিপোজিট: ${amount:.2f} = {coins:,} Coins\n\n"
+        "👉 ধাপ ২: আপনার পেমেন্টের স্ক্রিনশট (Photo) পাঠান:"
+    )
+
+@router.message(DepositState.waiting_photo, F.photo)
+async def deposit_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    amount = float(data["deposit_amount"])
+    coins = int(data["deposit_coins"])
+    with db.cursor() as cur:
+        cur.execute(
+            """INSERT INTO deposit_requests
+            (user_id, amount_usd, coins, photo_file_id, status, created_at)
+            VALUES(%s,%s,%s,%s, 'pending', %s) RETURNING id""",
+            (message.from_user.id, amount, coins, message.photo[-1].file_id, int(time.time())),
+        )
+        request_id = cur.fetchone()[0]
+    await state.clear()
+    await message.answer(
+        f"✅ ডিপোজিট রিকোয়েস্ট জমা হয়েছে।\nRequest ID: {request_id}\n"
+        "অ্যাডমিন যাচাই করে Accept বা Reject করবেন।",
+        reply_markup=user_keyboard(message.chat.id),
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_photo(
+                admin_id, message.photo[-1].file_id,
+                caption=(
+                    f"💰 <b>Deposit Request #{request_id}</b>\n\n"
+                    f"👤 User ID: <code>{message.from_user.id}</code>\n"
+                    f"💵 Amount: ${amount:.2f}\n"
+                    f"💎 Coins: {coins:,}\n"
+                    f"🟡 Pay ID: {setting('binance_pay_id')}\n"
+                    "Status: PENDING"
+                ),
+                parse_mode="HTML",
+                reply_markup=deposit_review_keyboard(request_id),
+            )
+        except Exception:
+            logger.exception("Could not notify admin %s", admin_id)
+
+@router.message(DepositState.waiting_photo)
+async def deposit_photo_required(message: Message):
+    await message.answer("❌ অনুগ্রহ করে পেমেন্টের স্ক্রিনশট Photo হিসেবে পাঠান।")
+
+@router.callback_query(F.data.startswith("dep_accept_"))
+async def deposit_accept(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    request_id = int(call.data.rsplit("_", 1)[1])
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT user_id, coins, status FROM deposit_requests WHERE id=%s", (request_id,))
+            req_row = cur.fetchone()
+            if not req_row or req_row[2] != "pending":
+                await call.message.reply("এই রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে বা পাওয়া যায়নি।")
+                return
+            user_id, coins, _ = req_row
+            cur.execute("UPDATE deposit_requests SET status='accepted', reviewed_at=%s, reviewed_by=%s WHERE id=%s AND status='pending'",
+                        (int(time.time()), call.from_user.id, request_id))
+            if cur.rowcount != 1:
+                await call.message.reply("রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে।")
+                return
+            ensure_user(user_id)
+            cur.execute("UPDATE users SET balance=balance+%s WHERE user_id=%s", (coins, user_id))
+    except Exception:
+        logger.exception("Deposit acceptance failed")
+        await call.message.reply("❌ ডিপোজিট গ্রহণ করা যায়নি।")
+        return
+    with suppress(Exception):
+        await bot.send_message(
+            user_id,
+            f"✅ আপনার Deposit #{request_id} Accept হয়েছে।\n💎 যোগ হয়েছে: {coins:,} Coins",
+        )
+    await call.message.edit_caption(
+        caption=f"✅ Deposit #{request_id} ACCEPTED\nUser: {user_id}\nCoins added: {coins:,}",
+        reply_markup=None,
+    )
+
+@router.callback_query(F.data.startswith("dep_reject_"))
+async def deposit_reject(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    request_id = int(call.data.rsplit("_", 1)[1])
+    with db.cursor() as cur:
+        cur.execute("SELECT user_id, status FROM deposit_requests WHERE id=%s", (request_id,))
+        r = cur.fetchone()
+        if not r or r[1] != 'pending':
+            await call.message.reply("রিকোয়েস্টটি ইতোমধ্যে প্রসেস করা হয়েছে বা পাওয়া যায়নি।")
+            return
+        user_id = r[0]
+        cur.execute(
+            """UPDATE deposit_requests SET status='rejected', reviewed_at=%s, reviewed_by=%s
+            WHERE id=%s AND status='pending'""",
+            (int(time.time()), call.from_user.id, request_id),
+        )
+    with suppress(Exception):
+        await bot.send_message(user_id, f"❌ আপনার Deposit #{request_id} Reject করা হয়েছে। প্রয়োজনে অ্যাডমিনের সঙ্গে যোগাযোগ করুন।")
+    await call.message.edit_caption(caption=f"❌ Deposit #{request_id} REJECTED", reply_markup=None)
+
+# =========================================================
+# HELP / TELEGRAM SESSION CONNECTION
+# =========================================================
 
 async def send_help(message: Message):
-    user_id = message.chat.id
     await message.answer(
         "ℹ️ <b>কিভাবে ব্যবহার করবে</b>\n\n"
-        "1️⃣ 🔐 Connect Telegram চাপো অথবা 🤖 Admin Session ব্যবহার করো।\n\n"
-        "2️⃣ 🎯 Target Channel সেট করো।\n"
-        "এই চ্যানেলের সদস্যদের যাচাই করা হবে।\n\n"
-        "3️⃣ 📺 Live Stream Channel সেট করো।\n"
-        "এখানে তোমার লাইভ চলবে।\n\n"
-        "4️⃣ লাইভ চালু রাখো। বট পর্যায়ক্রমে অংশগ্রহণকারীদের পরীক্ষা করবে।\n\n"
-        "5️⃣ 📊 Live Status থেকে অবস্থা দেখো।\n\n"
-        "⚠️ সব অংশগ্রহণকারী Telegram API-তে দৃশ্যমান নাও হতে পারে। "
-        "Unmute করার জন্য প্রয়োজনীয় call/admin permission লাগতে পারে।",
-        parse_mode="HTML",
-        reply_markup=main_keyboard(user_id),
+        "1️⃣ Connect Telegram অথবা অনুমোদিত Admin Session নির্বাচন করুন।\n"
+        "2️⃣ Target Channel সেট করুন।\n"
+        "3️⃣ Live Stream Channel সেট করুন।\n"
+        "4️⃣ Bot ON করুন।\n"
+        "5️⃣ লাইভ চললে নির্ধারিত Coin rate অনুযায়ী চার্জ হবে। লাইভ বন্ধ থাকলে চার্জ হবে না।\n"
+        "6️⃣ Top-up করতে পেমেন্টের স্ক্রিনশট পাঠান।\n\n"
+        "⚠️ সব অংশগ্রহণকারী Telegram API-তে দৃশ্যমান নাও হতে পারে। Unmute করার জন্য প্রয়োজনীয় call/admin permission লাগতে পারে।",
+        parse_mode="HTML", reply_markup=user_keyboard(message.chat.id),
     )
 
 @router.message(F.text == "ℹ️ Help")
@@ -477,218 +685,6 @@ async def help_text_handler(message: Message):
 async def help_callback(call: CallbackQuery):
     await call.answer()
     await send_help(call.message)
-
-=========================================================
-TOP-UP & DEPOSIT SYSTEM
-=========================================================
-
-@router.message(F.text == "💰 Top-up")
-async def topup_text_handler(message: Message, state: FSMContext):
-    await topup_handler(message, state)
-
-@router.callback_query(F.data == "topup")
-async def topup_callback(call: CallbackQuery, state: FSMContext):
-    await call.answer()
-    await topup_handler(call.message, state)
-
-async def topup_handler(message: Message, state: FSMContext):
-    user_id = message.chat.id
-    user = db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
-    current_balance = user["balance"] if user else 0.0
-
-    rate = float(get_setting("rate_per_usd"))
-    binance_id = get_setting("binance_pay_id")
-    min_dep = get_setting("min_deposit")
-
-    current_coins = int(current_balance * rate)
-
-    await state.set_state(DepositState.waiting_amount)
-    await message.answer(
-        f"💎 আপনার বর্তমান ব্যালেন্স: {current_coins} coins\n"
-        f"💵 রেট: $1 = {rate} Coins\n"
-        f"📌 সর্ব নিম্ন ডিপোজিট: ${min_dep}\n\n"
-        f"🟡 Binance Pay ID: <code>{binance_id}</code>\n\n"
-        "👉 ধাপ ১: কত ডলার ডিপোজিট করেছেন তা লিখুন (যেমন: 1, 5, 10):",
-        parse_mode="HTML"
-    )
-
-@router.message(DepositState.waiting_amount)
-async def process_deposit_amount(message: Message, state: FSMContext):
-    try:
-        amount = float(message.text.strip())
-        min_dep = float(get_setting("min_deposit"))
-        if amount < min_dep:
-            await message.answer(f"❌ সর্বনিম্ন ডিপোজিট ${min_dep}। সঠিক পরিমাণ লিখুন:")
-            return
-    except ValueError:
-        await message.answer("❌ সঠিক সংখ্যা লিখুন (যেমন: 5 বা 10):")
-        return
-
-    await state.update_data(deposit_amount=amount)
-    await state.set_state(DepositState.waiting_screenshot)
-    await message.answer("👉 ধাপ ২: আপনার পেমেন্টের স্ক্রিনশট (Photo) টি পাঠান:")
-
-@router.message(DepositState.waiting_screenshot, F.photo)
-async def process_deposit_screenshot(message: Message, state: FSMContext):
-    photo = message.photo[-1]
-    file_id = photo.file_id
-    data = await state.get_data()
-    amount = data.get("deposit_amount")
-    rate = float(get_setting("rate_per_usd"))
-    coins = amount * rate
-    user_id = message.chat.id
-
-    await state.clear()
-
-    cursor = db.execute(
-        "INSERT INTO deposits (user_id, amount_usd, coins, screenshot_file_id, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
-        (user_id, amount, coins, file_id, int(time.time()))
-    )
-    dep_id = cursor.lastrowid
-    db.commit()
-
-    await message.answer(
-        f"💰 আপনার ডিপোজিট: ${amount} = {coins} Coins\n\n"
-        "✅ আপনার পেমেন্ট রিকোয়েস্ট অ্যাডমিনের কাছে পাঠানো হয়েছে। অনুমোদন পেলে ব্যালেন্স যোগ হবে।",
-        reply_markup=main_keyboard(user_id)
-    )
-
-    # Notify Admins
-    for admin_id in ADMIN_IDS:
-        try:
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="✅ Approve", callback_data=f"dep_approve_{dep_id}"),
-                        InlineKeyboardButton(text="❌ Reject", callback_data=f"dep_reject_{dep_id}")
-                    ]
-                ]
-            )
-            await bot.send_photo(
-                admin_id,
-                photo=file_id,
-                caption=f"🔔 <b>New Deposit Request!</b>\n\n"
-                        f"👤 User ID: <code>{user_id}</code>\n"
-                        f"💵 Amount: ${amount}\n"
-                        f"💎 Coins: {coins}",
-                parse_mode="HTML",
-                reply_markup=kb
-            )
-        except Exception:
-            pass
-
-@router.callback_query(F.data.startswith("dep_approve_"))
-async def approve_deposit(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
-        return
-    await call.answer()
-    dep_id = int(call.data.split("_")[-1])
-    dep = db.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (dep_id,)).fetchone()
-    if not dep:
-        await call.message.edit_caption(caption="❌ রিকোয়েস্টটি ইতিমধ্যে প্রসেস করা হয়েছে।")
-        return
-
-    db.execute("UPDATE deposits SET status='approved' WHERE id=?", (dep_id,))
-    db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (dep["coins"], dep["user_id"]))
-    db.commit()
-
-    await call.message.edit_caption(
-        caption=f"{call.message.caption}\n\n✅ <b>Approved by Admin</b>",
-        parse_mode="HTML"
-    )
-
-    with suppress(Exception):
-        await bot.send_message(
-            dep["user_id"],
-            f"✅ আপনার ${dep['amount_usd']} ডিপোজিট সফল হয়েছে! অ্যাকাউন্টে {dep['coins']} Coins যোগ করা হয়েছে।"
-        )
-
-@router.callback_query(F.data.startswith("dep_reject_"))
-async def reject_deposit(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
-        return
-    await call.answer()
-    dep_id = int(call.data.split("_")[-1])
-    dep = db.execute("SELECT * FROM deposits WHERE id=? AND status='pending'", (dep_id,)).fetchone()
-    if not dep:
-        await call.message.edit_caption(caption="❌ রিকোয়েস্টটি ইতিমধ্যে প্রসেস করা হয়েছে।")
-        return
-
-    db.execute("UPDATE deposits SET status='rejected' WHERE id=?", (dep_id,))
-    db.commit()
-
-    await call.message.edit_caption(
-        caption=f"{call.message.caption}\n\n❌ <b>Rejected by Admin</b>",
-        parse_mode="HTML"
-    )
-
-    with suppress(Exception):
-        await bot.send_message(
-            dep["user_id"],
-            f"❌ আপনার ${dep['amount_usd']} ডিপোজিট রিকোয়েস্টটি বাতিল করা হয়েছে।"
-        )
-
-=========================================================
-PROFILE & BOT ON/OFF SYSTEM
-=========================================================
-
-@router.message(F.text == "👤 Profile")
-async def profile_text_handler(message: Message):
-    await show_profile(message)
-
-@router.callback_query(F.data == "profile")
-async def profile_callback(call: CallbackQuery):
-    await call.answer()
-    await show_profile(call.message)
-
-async def show_profile(message: Message):
-    user_id = message.chat.id
-    user = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not user:
-        return
-
-    channels = db.execute("SELECT * FROM channels WHERE owner_id=?", (user_id,)).fetchall()
-    chan_text = ""
-    for c in channels:
-        chan_text += f"• {c['channel_type'].upper()}: {c['channel_username']} ({c['title']})\n"
-
-    rate = float(get_setting("rate_per_usd"))
-    coins = user["balance"] * rate
-    spent_coins = user["total_spent"] * rate
-    bot_status = "🟢 ON" if user["bot_active"] else "🔴 OFF"
-    toggle_text = "Turn OFF Bot" if user["bot_active"] else "Turn ON Bot"
-    toggle_cb = "toggle_bot_off" if user["bot_active"] else "toggle_bot_on"
-
-    text = (
-        f"👤 <b>USER PROFILE</b>\n\n"
-        f"🆔 User ID: <code>{user['user_id']}</code>\n"
-        f"💎 Balance: {coins:.0f} Coins (${user['balance']:.2f})\n"
-        f"💸 Spent: {spent_coins:.0f} Coins (${user['total_spent']:.2f})\n"
-        f"🤖 Bot Status: {bot_status}\n\n"
-        f"📺 <b>Your Channels:</b>\n{chan_text or 'কোনো চ্যানেল সেট করা নেই'}"
-    )
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
-            [InlineKeyboardButton(text="💰 Top-up", callback_data="topup")],
-            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu_back")]
-        ]
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
-
-@router.callback_query(F.data.in_({"toggle_bot_on", "toggle_bot_off"}))
-async def toggle_bot_status(call: CallbackQuery):
-    await call.answer()
-    user_id = call.message.chat.id
-    new_status = 1 if call.data == "toggle_bot_on" else 0
-    db.execute("UPDATE users SET bot_active=? WHERE user_id=?", (new_status, user_id))
-    db.commit()
-    await show_profile(call.message)
-
-=========================================================
-CONNECT TELEGRAM
-=========================================================
 
 @router.message(F.text == "🔐 Connect Telegram")
 async def connect_text_handler(message: Message, state: FSMContext):
@@ -701,114 +697,84 @@ async def connect_callback(call: CallbackQuery, state: FSMContext):
 
 async def connect_telegram_menu(message: Message, state: FSMContext):
     user_id = message.chat.id
-
+    if is_blocked(user_id):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
+        return
     if is_connected_user(user_id):
         try:
             client = await ensure_client(user_id)
             me = await client.get_me()
-
             await message.answer(
-                "✅ <b>Telegram Already Connected</b>\n\n"
-                f"Account ID: <code>{me.id}</code>\n\n"
-                "এখন Target ও Live Channel সেট করো।",
-                parse_mode="HTML",
-                reply_markup=main_keyboard(user_id),
+                f"✅ Telegram Already Connected\nAccount ID: {me.id}",
+                reply_markup=user_keyboard(user_id),
             )
             return
         except Exception:
-            logger.warning("Saved Telegram session invalid for user %s", user_id)
             await disconnect_client(user_id)
-            db.execute("UPDATE users SET connected=0 WHERE user_id=?", (user_id,))
-            db.commit()
-
+            with db.cursor() as cur:
+                cur.execute("UPDATE users SET connected=0 WHERE user_id=%s", (user_id,))
     await state.set_state(StringSessionState.waiting_session)
     await message.answer(
         "🔐 <b>Connect via String Session</b>\n\n"
-        "নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর "
-        "Telethon String Session পাঠাও。\n\n"
-        "⚠️ এটি অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কাউকে শেয়ার করবে না।",
+        "শুধু নিজের বা ব্যবহারের অনুমতি আছে এমন Telegram account-এর session পাঠান।\n"
+        "⚠️ String Session অ্যাকাউন্টের গোপন প্রবেশ-তথ্য। কারও সঙ্গে শেয়ার করবেন না।",
         parse_mode="HTML",
     )
 
 @router.message(StringSessionState.waiting_session)
 async def process_string_session(message: Message, state: FSMContext):
     if not message.text:
-        await message.answer("❌ String Session টেক্সট হিসেবে পাঠাও।")
+        await message.answer("❌ String Session টেক্সট হিসেবে পাঠান।")
         return
-
     session_string = message.text.strip()
     user_id = message.chat.id
-
     if len(session_string) < 30:
-        await message.answer("❌ String Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করো。")
+        await message.answer("❌ Session অসম্পূর্ণ মনে হচ্ছে। আবার চেষ্টা করুন।")
         return
-
     await disconnect_client(user_id)
-
     client = TelegramClient(
-        StringSession(session_string),
-        API_ID,
-        API_HASH,
-        device_model="Telegram Auto Speaker",
-        system_version="Python",
-        app_version="1.0",
-        connection_retries=3,
-        timeout=30,
-        auto_reconnect=True,
+        StringSession(session_string), API_ID, API_HASH,
+        device_model="Telegram Auto Speaker", system_version="Python",
+        app_version="1.0", connection_retries=3, timeout=30, auto_reconnect=True,
     )
-
     try:
         await client.connect()
-
         if not await client.is_user_authorized():
             await client.disconnect()
-            await message.answer("❌ Session অনুমোদিত নয় বা মেয়াদোত্তীর্ণ। সঠিক session দিয়ে আবার চেষ্টা করো।")
+            await message.answer("❌ Session অনুমোদিত নয় বা মেয়াদোত্তীর্ণ।")
             return
-
         me = await client.get_me()
         if not me:
             await client.disconnect()
             await message.answer("❌ Telegram account যাচাই করা যায়নি।")
             return
-
         clients[user_id] = client
-
-        db.execute(
-            """
-            INSERT INTO users
-                (user_id, session_string, connected, blocked, created_at)
-            VALUES (?, ?, 1, 0, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                session_string=excluded.session_string,
-                connected=1,
-                created_at=excluded.created_at
-            """,
-            (user_id, session_string, int(time.time())),
-        )
-        db.execute("DELETE FROM user_admin_sessions WHERE user_id=?", (user_id,))
-        db.commit()
-
+        with db.cursor() as cur:
+            cur.execute(
+                """INSERT INTO users(user_id,session_string,connected,blocked,created_at)
+                VALUES(%s,%s,1,0,%s)
+                ON CONFLICT(user_id) DO UPDATE SET session_string=EXCLUDED.session_string,
+                connected=1, created_at=EXCLUDED.created_at""",
+                (user_id, session_string, int(time.time())),
+            )
+            cur.execute("DELETE FROM user_admin_sessions WHERE user_id=%s", (user_id,))
         await state.clear()
         with suppress(Exception):
             await message.delete()
-
         await message.answer(
-            "✅ <b>Telegram Connected Successfully!</b>\n\n"
-            f"Account ID: <code>{me.id}</code>\n\n"
-            "এখন Target ও Live Channel সেট করো।",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(user_id),
+            f"✅ Telegram Connected Successfully!\nAccount ID: {me.id}",
+            reply_markup=user_keyboard(user_id),
         )
     except Exception:
         logger.exception("Telegram session connection failed for user %s", user_id)
         with suppress(Exception):
             await client.disconnect()
         await state.clear()
-        await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID এবং API_HASH যাচাই করে আবার চেষ্টা করো।")
+        await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID ও API_HASH যাচাই করুন।")
 
-=========================================================
-ADMIN SESSION USER MENU
-=========================================================
+# =========================================================
+# ADMIN SESSION SELECTOR (legacy feature)
+# =========================================================
 
 @router.message(F.text == "🤖 Admin Session")
 async def admin_session_text_handler(message: Message):
@@ -820,63 +786,42 @@ async def admin_session_callback(call: CallbackQuery):
     await show_admin_session_menu(call.message)
 
 async def show_admin_session_menu(message: Message):
-    user_id = message.chat.id
-    sessions = db.execute("SELECT * FROM admin_sessions").fetchall()
-
+    uid = message.chat.id
+    with db.cursor() as cur:
+        cur.execute("SELECT id, username FROM admin_sessions")
+        sessions = cur.fetchall()
     if not sessions:
-        await message.answer(
-            "🤖 <b>Admin Session</b>\n\n"
-            "বর্তমানে কোনো অ্যাডমিন সেশন যুক্ত করা হয়নি।",
-            parse_mode="HTML",
-            reply_markup=main_keyboard(user_id),
-        )
+        await message.answer("🤖 বর্তমানে কোনো Admin Session যোগ করা হয়নি।", reply_markup=user_keyboard(uid))
         return
-
-    keyboard = []
-    for s in sessions:
-        keyboard.append([InlineKeyboardButton(text=f"📱 @{s['username']}", callback_data=f"use_admin_sess_{s['id']}")])
-
-    keyboard.append([InlineKeyboardButton(text="🔙 Back", callback_data="main_menu_back")])
-
+    kb = [[InlineKeyboardButton(text=f"📱 @{s[1]}", callback_data=f"use_admin_sess_{s[0]}")] for s in sessions]
+    kb.append([InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu_back")])
     await message.answer(
-        "🤖 <b>Admin Session List</b>\n\n"
-        "নিচের তালিকা থেকে একটি অ্যাডমিন সেশন সিলেক্ট করুন:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        "নিচের তালিকা থেকে সেশন নির্বাচন করুন। শুধুমাত্র যথাযথ অনুমতি থাকা সেশন ব্যবহার করুন:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
 
 @router.callback_query(F.data.startswith("use_admin_sess_"))
 async def select_admin_session(call: CallbackQuery):
     await call.answer()
-    user_id = call.message.chat.id
-    session_id = int(call.data.split("_")[-1])
+    uid = call.from_user.id
+    sid = int(call.data.rsplit("_", 1)[1])
+    with db.cursor() as cur:
+        cur.execute("SELECT id, username FROM admin_sessions WHERE id=%s", (sid,))
+        row = cur.fetchone()
+        if not row:
+            await call.message.answer("❌ সেশনটি পাওয়া যায়নি।")
+            return
+        cur.execute(
+            """INSERT INTO user_admin_sessions(user_id,session_id,created_at) VALUES(%s,%s,%s)
+            ON CONFLICT(user_id) DO UPDATE SET session_id=EXCLUDED.session_id,created_at=EXCLUDED.created_at""",
+            (uid, sid, int(time.time())),
+        )
+    await disconnect_client(uid)
+    await call.message.answer(f"✅ Admin Session নির্বাচিত: @{row[1]}", reply_markup=user_keyboard(uid))
 
-    session_row = db.execute("SELECT * FROM admin_sessions WHERE id=?", (session_id,)).fetchone()
-    if not session_row:
-        await call.message.answer("❌ সেশনটি পাওয়া যায়নি।")
-        return
-
-    db.execute(
-        """
-        INSERT INTO user_admin_sessions (user_id, session_id, created_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET session_id=excluded.session_id
-        """,
-        (user_id, session_id, int(time.time()))
-    )
-    db.commit()
-    await disconnect_client(user_id)
-
-    await call.message.edit_text(
-        f"✅ <b>Admin Session Selected:</b> @{session_row['username']}\n\n"
-        "এখন Target ও Live Channel সেট করুন।",
-        parse_mode="HTML",
-        reply_markup=main_menu(user_id),
-    )
-
-=========================================================
-TARGET & LIVE CHANNEL MENUS
-=========================================================
+# =========================================================
+# TARGET / LIVE CHANNEL SETUP
+# =========================================================
 
 @router.message(F.text == "🎯 Target Channel")
 async def target_text_handler(message: Message, state: FSMContext):
@@ -888,28 +833,18 @@ async def target_callback(call: CallbackQuery, state: FSMContext):
     await target_start(call.message, state)
 
 async def target_start(message: Message, state: FSMContext):
-    user_id = message.chat.id
-    has_admin_sess = db.execute("SELECT * FROM user_admin_sessions WHERE user_id=?", (user_id,)).fetchone()
-    if not is_connected_user(user_id) and not has_admin_sess:
-        await message.answer("❌ আগে 🔐 Connect Telegram অথবা 🤖 Admin Session সিলেক্ট করো।")
+    uid = message.chat.id
+    if is_blocked(uid):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
         return
-
-    old = get_channel(user_id, "target")
-    if old:
-        await message.answer(
-            "🎯 <b>Target Channel</b>\n\n"
-            f"📺 {old['title'] or 'Unknown'}\n"
-            f"🔗 {old['channel_username']}\n\n"
-            "পরিবর্তন করতে নতুন @username পাঠাও।",
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(
-            "🎯 <b>Target Channel</b>\n\n"
-            "যে চ্যানেলের সদস্যদের যাচাই করতে চাও তার public username পাঠাও。\n"
-            "উদাহরণ: <code>@MyTargetChannel</code>",
-            parse_mode="HTML",
-        )
+    if not is_connected_user(uid) and not has_admin_session(uid):
+        await message.answer("❌ আগে Connect Telegram অথবা Admin Session নির্বাচন করুন।")
+        return
+    old = get_channel(uid, "target")
+    await message.answer(
+        ("🎯 বর্তমান Target: " + f"{old['title']} ({old['channel_username']})\n" if old else "")
+        + "Target Channel-এর public username পাঠান, যেমন @MyTargetChannel"
+    )
     await state.set_state(TargetChannelState.waiting_channel)
 
 @router.message(F.text == "📺 Live Stream Channel")
@@ -922,37 +857,19 @@ async def live_callback(call: CallbackQuery, state: FSMContext):
     await live_start(call.message, state)
 
 async def live_start(message: Message, state: FSMContext):
-    user_id = message.chat.id
-    has_admin_sess = db.execute("SELECT * FROM user_admin_sessions WHERE user_id=?", (user_id,)).fetchone()
-    if not is_connected_user(user_id) and not has_admin_sess:
-        await message.answer("❌ আগে 🔐 Connect Telegram অথবা 🤖 Admin Session সিলেক্ট করো।")
+    uid = message.chat.id
+    if is_blocked(uid):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
         return
-
-    old = get_channel(user_id, "live")
-    if old:
-        await message.answer(
-            "📺 <b>Live Stream Channel</b>\n\n"
-            f"📺 {old['title'] or 'Unknown'}\n"
-            f"🔗 {old['channel_username']}\n\n"
-            "পরিবর্তন করতে নতুন @username পাঠাও।",
-            parse_mode="HTML",
-        )
-    else:
-        await message.answer(
-            "📺 <b>Live Stream Channel</b>\n\n"
-            "যে public চ্যানেলে তুমি লাইভ করো তার username পাঠাও。\n"
-            "উদাহরণ: <code>@MyLiveChannel</code>",
-            parse_mode="HTML",
-        )
+    if not is_connected_user(uid) and not has_admin_session(uid):
+        await message.answer("❌ আগে Connect Telegram অথবা Admin Session নির্বাচন করুন।")
+        return
+    old = get_channel(uid, "live")
+    await message.answer(
+        ("📺 বর্তমান Live: " + f"{old['title']} ({old['channel_username']})\n" if old else "")
+        + "Live Stream Channel-এর public username পাঠান, যেমন @MyLiveChannel"
+    )
     await state.set_state(LiveChannelState.waiting_channel)
-
-@router.message(TargetChannelState.waiting_channel)
-async def save_target_channel(message: Message, state: FSMContext):
-    await save_channel(message, state, "target")
-
-@router.message(LiveChannelState.waiting_channel)
-async def save_live_channel(message: Message, state: FSMContext):
-    await save_channel(message, state, "live")
 
 def normalize_username(value):
     value = (value or "").strip()
@@ -964,163 +881,196 @@ def normalize_username(value):
         value = "@" + value
     return value
 
+@router.message(TargetChannelState.waiting_channel)
+async def save_target_channel(message: Message, state: FSMContext):
+    await save_channel(message, state, "target")
+
+@router.message(LiveChannelState.waiting_channel)
+async def save_live_channel(message: Message, state: FSMContext):
+    await save_channel(message, state, "live")
+
 async def save_channel(message: Message, state: FSMContext, channel_type: str):
-    user_id = message.chat.id
+    uid = message.chat.id
     username = normalize_username(message.text)
-
     if not username or username == "@":
-        await message.answer("❌ সঠিক public Channel username দাও, যেমন @MyChannel")
+        await message.answer("❌ সঠিক public Channel username দিন, যেমন @MyChannel")
         return
-
     try:
-        client = await ensure_client(user_id)
+        client = await ensure_client(uid)
         entity = await client.get_entity(username)
-
         if not isinstance(entity, (types.Channel, types.Chat)):
             await message.answer("❌ এটি Telegram Channel/Group হিসেবে শনাক্ত হয়নি।")
             return
-
         title = getattr(entity, "title", username)
-
-        db.execute(
-            """
-            INSERT INTO channels (
-                owner_id,
-                channel_type,
-                channel_username,
-                channel_id,
-                title,
-                active,
-                auto_allow,
-                created_at
+        with db.cursor() as cur:
+            cur.execute(
+                """INSERT INTO channels(owner_id,channel_type,channel_username,channel_id,title,active,auto_allow,created_at)
+                VALUES(%s,%s,%s,%s,%s,1,1,%s)
+                ON CONFLICT(owner_id,channel_type) DO UPDATE SET
+                channel_username=EXCLUDED.channel_username,channel_id=EXCLUDED.channel_id,
+                title=EXCLUDED.title,active=1,created_at=EXCLUDED.created_at""",
+                (uid, channel_type, username, entity.id, title, int(time.time())),
             )
-            VALUES (?, ?, ?, ?, ?, 1, 1, ?)
-            ON CONFLICT(owner_id, channel_type) DO UPDATE SET
-                channel_username=excluded.channel_username,
-                channel_id=excluded.channel_id,
-                title=excluded.title,
-                active=1,
-                created_at=excluded.created_at
-            """,
-            (user_id, channel_type, username, entity.id, title, int(time.time())),
+        await state.clear()
+        await message.answer(
+            f"✅ {channel_type.title()} Channel Added\n📺 {title}\n🔗 {username}",
+            reply_markup=user_keyboard(uid),
         )
-        db.commit()
-        await state.clear()
-
-        if channel_type == "target":
-            text = f"✅ <b>Target Channel Added</b>\n\n📺 {title}\n🔗 {username}\n\nএখন 📺 Live Stream Channel সেট করো।"
-        else:
-            text = f"✅ <b>Live Stream Channel Added</b>\n\n📺 {title}\n🔗 {username}\n\nলাইভ চালু হলে 📊 Live Status দিয়ে পরীক্ষা করো।"
-
-        await message.answer(text, parse_mode="HTML", reply_markup=main_keyboard(user_id))
+    except FloodWaitError as exc:
+        await message.answer(f"⏳ Telegram বিরতি চেয়েছে। {exc.seconds} সেকেন্ড পরে চেষ্টা করুন।")
     except Exception:
-        logger.exception("Channel setup failed")
+        logger.exception("Channel setup failed: user=%s type=%s", uid, channel_type)
         await state.clear()
-        await message.answer("❌ Channel যোগ করা যায়নি।")
+        await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
 
-=========================================================
-LIVE CALL FUNCTIONS & MONITOR (WITH BALANCE DEDUCTION)
-=========================================================
+# =========================================================
+# LIVE CALL HELPERS (Optimized & Limit Increased)
+# =========================================================
 
 async def get_active_call(client, channel_username):
     entity = await client.get_entity(channel_username)
     full = await client(functions.channels.GetFullChannelRequest(channel=entity))
-    call = getattr(full.full_chat, "call", None)
-    return call, entity
+    return getattr(full.full_chat, "call", None), entity
 
 async def get_participants(client, call):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
-    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=100))
+    result = await client(functions.phone.GetGroupCallRequest(call=input_call, limit=300))
     users = {user.id: user for user in getattr(result, "users", [])}
-    participants = list(getattr(result, "participants", []))
-    return participants, users
+    return list(getattr(result, "participants", [])), users
 
 async def is_target_member(client, target_entity, user):
     try:
         input_user = await client.get_input_entity(user)
         result = await client(functions.channels.GetParticipantRequest(channel=target_entity, participant=input_user))
-        member = result.participant
-        if isinstance(member, (types.ChannelParticipantLeft, types.ChannelParticipantBanned)):
-            return False
-        return True
-    except Exception:
+        return not isinstance(result.participant, (types.ChannelParticipantLeft, types.ChannelParticipantBanned))
+    except FloodWaitError:
+        raise
+    except RPCError as exc:
+        logger.debug("Membership check failed: %s", exc)
+        return False
+    except Exception as exc:
+        logger.debug("Membership check error: %s", exc)
         return False
 
 async def allow_participant(client, call, user):
     input_call = types.InputGroupCall(id=call.id, access_hash=call.access_hash)
     input_user = await client.get_input_entity(user)
-    return await client(functions.phone.EditGroupCallParticipantRequest(call=input_call, participant=input_user, muted=False))
+    return await client(functions.phone.EditGroupCallParticipantRequest(
+        call=input_call, participant=input_user, muted=False
+    ))
+
+# =========================================================
+# LIVE BILLING + MONITOR
+# =========================================================
+
+async def charge_live_minute(user_id):
+    rate = max(0, int(float(setting("coins_per_minute"))))
+    u = user_row(user_id)
+    if rate <= 0:
+        return True
+    try:
+        with db.cursor() as cur:
+            cur.execute("SELECT balance FROM users WHERE user_id=%s", (user_id,))
+            fresh = cur.fetchone()
+            if not fresh or fresh[0] < rate:
+                cur.execute("UPDATE users SET bot_enabled=0,billing_seconds=0,billing_last_ts=0 WHERE user_id=%s", (user_id,))
+                return False
+            cur.execute(
+                "UPDATE users SET balance=balance-%s, total_spent=total_spent+%s WHERE user_id=%s",
+                (rate, rate, user_id),
+            )
+        return True
+    except Exception:
+        logger.exception("Charge live minute failed")
+        raise
+
+async def bill_if_live(user_id, is_live):
+    u = user_row(user_id)
+    now = int(time.time())
+    if not u["bot_enabled"] or not is_live or is_blocked(user_id):
+        with db.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET billing_seconds=0, billing_last_ts=0 WHERE user_id=%s",
+                (user_id,),
+            )
+        return True
+
+    last_ts = int(u["billing_last_ts"] or 0)  
+    elapsed = max(0, min(now - last_ts, 2 * 60)) if last_ts else 0  
+    seconds = int(u["billing_seconds"] or 0) + elapsed  
+    with db.cursor() as cur:
+        cur.execute("UPDATE users SET billing_last_ts=%s WHERE user_id=%s", (now, user_id))  
+
+    while seconds >= 60:  
+        if not await charge_live_minute(user_id):  
+            return False  
+        seconds -= 60  
+    with db.cursor() as cur:
+        cur.execute("UPDATE users SET billing_seconds=%s WHERE user_id=%s", (seconds, user_id))  
+    return True
 
 async def monitor_user(user_id):
     lock = get_lock(monitor_locks, user_id)
     if lock.locked():
         return
-
     async with lock:
-        user_row = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-        if not user_row or not user_row["bot_active"]:
+        u = user_row(user_id)
+        if is_blocked(user_id) or not u["bot_enabled"]:
             return
-
         target_row = get_channel(user_id, "target")
         live_row = get_channel(user_id, "live")
-
         if not target_row or not live_row:
             return
-
-        has_admin_sess = db.execute("SELECT * FROM user_admin_sessions WHERE user_id=?", (user_id,)).fetchone()
-        if not is_connected_user(user_id) and not has_admin_sess:
+        if not is_connected_user(user_id) and not has_admin_session(user_id):
             return
-
         try:
             client = await ensure_client(user_id)
             call, _ = await get_active_call(client, live_row["channel_username"])
-
             if not call:
+                await bill_if_live(user_id, False)
                 return
-
-            # লাইভ কল চালু আছে, তাই ব্যালেন্স কাটবে (સમয় অনুযায়ী)
-            cost_per_min = float(get_setting("cost_per_minute"))
-            rate = float(get_setting("rate_per_usd"))
-            # MONITOR_INTERVAL সেকেন্ড হিসেবে খরচ হিসাব
-            cost_usd = (cost_per_min / rate) * (MONITOR_INTERVAL / 60.0)
-
-            if user_row["balance"] < cost_usd:
-                db.execute("UPDATE users SET bot_active=0 WHERE user_id=?", (user_id,))
-                db.commit()
+            if not await bill_if_live(user_id, True):
                 with suppress(Exception):
-                    await bot.send_message(user_id, "⚠️ আপনার ব্যালেন্স শেষ হয়ে যাওয়ায় বট অটোমেটিক অফ করা হয়েছে। দয়া করে টপ-আপ করুন।")
+                    await bot.send_message(user_id, "💸 Balance অপর্যাপ্ত। Bot OFF করা হয়েছে; Top-up করুন।",
+                                           reply_markup=user_keyboard(user_id))
                 return
-
-            db.execute("UPDATE users SET balance = balance - ?, total_spent = total_spent + ? WHERE user_id=?", (cost_usd, cost_usd, user_id))
-            db.commit()
-
             target_entity = await client.get_entity(target_row["channel_username"])
             participants, users = await get_participants(client, call)
-
-            for participant in participants:
+            
+            async def process_participant(participant):
                 peer = getattr(participant, "peer", None)
                 if not isinstance(peer, types.PeerUser):
-                    continue
-
-                user_id_in_call = peer.user_id
-                user_entity = users.get(user_id_in_call)
+                    return
+                uid = peer.user_id
+                user_entity = users.get(uid)
                 if user_entity is None:
-                    with suppress(Exception):
-                        user_entity = await client.get_entity(user_id_in_call)
-
-                if user_entity is None:
-                    continue
-
+                    try:
+                        user_entity = await client.get_entity(uid)
+                    except Exception:
+                        return
                 if not await is_target_member(client, target_entity, user_entity):
-                    continue
-
+                    return
                 if not getattr(participant, "muted", False):
-                    continue
-
-                with suppress(Exception):
+                    return
+                try:
                     await allow_participant(client, call, user_entity)
-                await asyncio.sleep(0.15)
+                    logger.info("Unmute request sent for user=%s", uid)
+                except FloodWaitError as exc:
+                    logger.warning("FloodWait %s seconds", exc.seconds)
+                    await asyncio.sleep(min(exc.seconds, 10))
+                except RPCError as exc:
+                    logger.warning("Telegram rejected unmute for %s: %s", uid, exc)
+                except Exception:
+                    logger.exception("Could not unmute participant %s", uid)
 
+            tasks = [process_participant(p) for p in participants]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        except FloodWaitError as exc:
+            logger.warning("Monitor FloodWait user=%s seconds=%s", user_id, exc.seconds)
+        except RPCError as exc:
+            logger.warning("Monitor API error user=%s: %s", user_id, exc)
         except Exception:
             logger.exception("Monitor error for user=%s", user_id)
 
@@ -1128,20 +1078,17 @@ async def auto_monitor():
     logger.info("Auto Speaker Monitor started; interval=%s seconds", MONITOR_INTERVAL)
     while True:
         try:
-            rows = db.execute("SELECT DISTINCT owner_id FROM channels WHERE active=1").fetchall()
+            with db.cursor() as cur:
+                cur.execute("SELECT user_id FROM users WHERE bot_enabled=1 AND blocked=0")
+                rows = cur.fetchall()
             for row in rows:
-                await monitor_user(row["owner_id"])
-                await asyncio.sleep(0.25)
+                await monitor_user(row[0])
+            await asyncio.sleep(0.1)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Auto-monitor loop error")
-
-        await asyncio.sleep(MONITOR_INTERVAL)
-
-=========================================================
-LIVE STATUS
-=========================================================
+            await asyncio.sleep(MONITOR_INTERVAL)
 
 @router.message(F.text == "📊 Live Status")
 async def status_text_handler(message: Message):
@@ -1153,414 +1100,536 @@ async def status_callback(call: CallbackQuery):
     await live_status_message(call.message)
 
 async def live_status_message(message: Message):
-    user_id = message.chat.id
-    has_admin_sess = db.execute("SELECT * FROM user_admin_sessions WHERE user_id=?", (user_id,)).fetchone()
-    if not is_connected_user(user_id) and not has_admin_sess:
-        await message.answer("❌ আগে 🔐 Connect Telegram করো অথবা 🤖 Admin Session সিলেক্ট করো。")
+    uid = message.chat.id
+    if is_blocked(uid):
+        await message.answer("🚫 আপনার অ্যাকাউন্ট ব্লক করা হয়েছে।")
         return
-
-    target_row = get_channel(user_id, "target")
-    live_row = get_channel(user_id, "live")
-
-    if not target_row or not live_row:
-        await message.answer("❌ Target বা Live Channel সেট করা হয়নি।")
+    target = get_channel(uid, "target")
+    live = get_channel(uid, "live")
+    if not target or not live:
+        await message.answer("❌ আগে Target Channel এবং Live Stream Channel সেট করুন।")
         return
-
+    u = user_row(uid)
     try:
-        client = await ensure_client(user_id)
-        call, _ = await get_active_call(client, live_row["channel_username"])
-
+        client = await ensure_client(uid)
+        call, _ = await get_active_call(client, live["channel_username"])
         if not call:
-            await message.answer("🔴 <b>LIVE OFFLINE</b>", parse_mode="HTML", reply_markup=main_keyboard(user_id))
+            await bill_if_live(uid, False)
+            await message.answer(
+                f"🔴 LIVE OFFLINE\n🎯 Target: {target['title']}\n📺 Live: {live['title']}\n"
+                f"💎 Balance: {u['balance']:,}\n⏯️ Bot: {'ON' if u['bot_enabled'] else 'OFF'}",
+                reply_markup=user_keyboard(uid),
+            )
             return
-
-        await message.answer("🎙 <b>LIVE ONLINE & MONITORING ACTIVE</b>", parse_mode="HTML", reply_markup=main_keyboard(user_id))
-    except Exception:
-        await message.answer("❌ Status পাওয়া যায়নি।")
-
-=========================================================
-ADMIN PANEL & USER REPORTS
-=========================================================
-
-@router.message(F.text == "👑 Admin Panel")
-async def admin_panel_text(message: Message):
-    if message.chat.id not in ADMIN_IDS:
-        return
-    await show_admin_panel(message)
-
-async def show_admin_panel(message: Message):
-    total_users = db.execute("SELECT COUNT() as c FROM users").fetchone()["c"]
-    active_sessions = db.execute("SELECT COUNT() as c FROM admin_sessions").fetchone()["c"]
-
-    text = (
-        "👑 <b>ADMIN PANEL</b>\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"🤖 Admin Sessions: {active_sessions}\n\n"
-        "নিচের অপশনগুলো থেকে ম্যানেজ করুন:"
-    )
-    await message.answer(text, parse_mode="HTML", reply_markup=admin_keyboard())
-
-@router.message(F.text == "📋 User Reports")
-async def admin_user_reports(message: Message):
-    if message.chat.id not in ADMIN_IDS:
-        return
-
-    users = db.execute("SELECT * FROM users").fetchall()
-    rate = float(get_setting("rate_per_usd"))
-
-    text = "📋 <b>USER REPORTS</b>\n\n"
-    for u in users:
-        channels = db.execute("SELECT * FROM channels WHERE owner_id=?", (u["user_id"],)).fetchall()
-        chan_list = ", ".join([c["channel_username"] for c in channels]) or "কোনো চ্যানেল নেই"
-        balance_coins = u["balance"] * rate
-        spent_coins = u["total_spent"] * rate
-
-        text += (
-            f"🆔 ID: <code>{u['user_id']}</code>\n"
-            f"📺 Channels: {chan_list}\n"
-            f"💎 Balance: {balance_coins:.0f} Coins\n"
-            f"💸 Spent: {spent_coins:.0f} Coins\n"
-            f"-----------------------------------\n"
+        target_entity = await client.get_entity(target["channel_username"])
+        participants, users = await get_participants(client, call)
+        members = muted = allowed = unchecked = 0
+        for participant in participants:
+            peer = getattr(participant, "peer", None)
+            if not isinstance(peer, types.PeerUser):
+                continue
+            entity = users.get(peer.user_id)
+            if entity is None:
+                try:
+                    entity = await client.get_entity(peer.user_id)
+                except Exception:
+                    unchecked += 1
+                    continue
+            try:
+                member = await is_target_member(client, target_entity, entity)
+            except FloodWaitError:
+                unchecked += 1
+                continue
+            if not member:
+                unchecked += 1
+                continue
+            members += 1
+            if getattr(participant, "muted", False):
+                muted += 1
+            else:
+                allowed += 1
+        await message.answer(
+            f"🎙 <b>LIVE STATUS</b>\n\n🎯 Target: {target['title']}\n📺 Live: {live['title']}\n"
+            f"👥 শনাক্ত Target Members: {members}\n🔇 Muted: {muted}\n🎤 Unmuted: {allowed}\n"
+            f"👤 অন্য সদস্য: {unchecked}\n\n"
+            f"⏯️ Bot: {'🟢 ON' if u['bot_enabled'] else '🔴 OFF'}\n"
+            f"💎 Balance: {u['balance']:,} Coins",
+            parse_mode="HTML", reply_markup=user_keyboard(uid),
         )
+    except Exception:
+        logger.exception("Status check failed for user %s", uid)
+        await message.answer("❌ Status পাওয়া যায়নি। Session, channel access ও live call যাচাই করুন।")
 
-    # যদি লেখা বড় হয় তাহলে ভাগ করে পাঠাতে হবে
-    if len(text) > 4000:
-        for x in range(0, len(text), 4000):
-            await message.answer(text[x:x+4000], parse_mode="HTML")
-    else:
-        await message.answer(text, parse_mode="HTML", reply_markup=admin_keyboard())
+# =========================================================
+# ADMIN: DEPOSIT REQUESTS / SETTINGS / REPORTS
+# =========================================================
 
-@router.message(F.text == "⚙️ Manage Settings")
-async def admin_manage_settings(message: Message):
-    if message.chat.id not in ADMIN_IDS:
+@router.message(F.text == "💰 Deposit Requests")
+async def deposits_text(message: Message):
+    await show_deposit_requests(message, message.from_user.id)
+
+@router.callback_query(F.data == "admin_deposits")
+async def deposits_callback(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
+    await call.answer()
+    await show_deposit_requests(call.message, call.from_user.id)
 
-    binance_id = get_setting("binance_pay_id")
-    rate = get_setting("rate_per_usd")
-    min_dep = get_setting("min_deposit")
-    cost_min = get_setting("cost_per_minute")
+async def show_deposit_requests(message, actor_id):
+    if not is_admin(actor_id):
+        return
+    with db.cursor() as cur:
+        cur.execute("SELECT id, user_id, amount_usd, coins, photo_file_id, status, created_at FROM deposit_requests WHERE status='pending' ORDER BY id ASC LIMIT 20")
+        rows = cur.fetchall()
+    if not rows:
+        await message.answer("💰 কোনো Pending Deposit Request নেই।", reply_markup=admin_reply_keyboard())
+        return
+    for r in rows:
+        try:
+            await bot.send_photo(
+                actor_id, r[4],
+                caption=(f"💰 <b>Deposit #{r[0]}</b>\nUser: <code>{r[1]}</code>\n"
+                         f"Amount: ${r[2]:.2f}\nCoins: {r[3]:,}\nStatus: PENDING"),
+                parse_mode="HTML", reply_markup=deposit_review_keyboard(r[0]),
+            )
+        except Exception:
+            logger.exception("Could not send deposit request %s", r[0])
 
+@router.message(F.text == "⚙️ Deposit Settings")
+async def settings_text(message: Message):
+    await show_settings(message, message.from_user.id)
+
+@router.callback_query(F.data == "admin_settings")
+async def settings_callback(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    await show_settings(call.message, call.from_user.id)
+
+async def show_settings(message, actor_id):
+    if not is_admin(actor_id):
+        return
     text = (
-        "⚙️ <b>Manage Settings</b>\n\n"
-        f"1️⃣ Binance Pay ID: <code>{binance_id}</code>\n"
-        f"2️⃣ Rate ($1 = Coins): {rate}\n"
-        f"3️⃣ Min Deposit ($): {min_dep}\n"
-        f"4️⃣ Cost per Minute (Coins): {cost_min}\n\n"
-        "পরিবর্তন করতে নিচের বাটনে ক্লিক করুন:"
+        "⚙️ <b>Deposit & Billing Settings</b>\n\n"
+        f"🟡 Binance Pay ID: <code>{setting('binance_pay_id')}</code>\n"
+        f"💵 Coins per $1: {int(setting('coins_per_dollar')):,}\n"
+        f"🔻 Minimum deposit: ${float(setting('min_deposit_usd')):g}\n"
+        f"⏱️ Coins per live minute: {int(setting('coins_per_minute')):,}\n\n"
+        "নিচের অপশন থেকে পরিবর্তন করুন:"
     )
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✏️ Change Binance Pay ID", callback_data="set_binance_id")],
-            [InlineKeyboardButton(text="✏️ Change Rate", callback_data="set_rate")],
-            [InlineKeyboardButton(text="✏️ Change Min Deposit", callback_data="set_min_dep")],
-            [InlineKeyboardButton(text="✏️ Change Cost/Minute", callback_data="set_cost_min")],
-            [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel_back_to_menu")]
-        ]
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟡 Change Binance Pay ID", callback_data="set_payid")],
+        [InlineKeyboardButton(text="💵 Change Coins per Dollar", callback_data="set_rate")],
+        [InlineKeyboardButton(text="🔻 Change Minimum Deposit", callback_data="set_minimum")],
+        [InlineKeyboardButton(text="⏱️ Change Coins per Minute", callback_data="set_charge")],
+        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")],
+    ])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-@router.callback_query(F.data.startswith("set_"))
-async def start_edit_setting(call: CallbackQuery, state: FSMContext):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.callback_query(F.data.in_({"set_payid", "set_rate", "set_minimum", "set_charge"}))
+async def setting_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    key_map = {
-        "set_binance_id": ("binance_pay_id", "নতুন Binance Pay ID দিন:"),
-        "set_rate": ("rate_per_usd", "নতুন রেট দিন (যেমন: 65000):"),
-        "set_min_dep": ("min_deposit", "সর্বনিম্ন ডিপোজিট ($) দিন:"),
-        "set_cost_min": ("cost_per_minute", "প্রতি মিনিটের খরচ (Coins) দিন:")
+    mapping = {
+        "set_payid": (DepositSettingState.waiting_pay_id, "নতুন Binance Pay ID পাঠান:"),
+        "set_rate": (DepositSettingState.waiting_rate, "প্রতি $1-এ কত Coins হবে তা লিখুন (পূর্ণ সংখ্যা):"),
+        "set_minimum": (DepositSettingState.waiting_minimum, "সর্বনিম্ন Deposit কত USD হবে লিখুন:"),
+        "set_charge": (DepositSettingState.waiting_charge, "প্রতি Live মিনিটে কত Coins কাটবে লিখুন (0 দিলে billing বন্ধ):"),
     }
-    setting_key, prompt_text = key_map[call.data]
-    await state.update_data(setting_key=setting_key)
-    await state.set_state(EditSettingsState.waiting_value)
-    await call.message.answer(prompt_text)
+    next_state, prompt = mapping[call.data]
+    await state.set_state(next_state)
+    await call.message.answer(prompt)
 
-@router.message(EditSettingsState.waiting_value)
-async def save_new_setting(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
+@router.message(DepositSettingState.waiting_pay_id)
+async def save_pay_id(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
-    data = await state.get_data()
-    key = data.get("setting_key")
-    value = message.text.strip()
+    value = (message.text or "").strip()
+    if not value or len(value) > 100:
+        await message.answer("❌ সঠিক Binance Pay ID দিন।")
+        return
+    set_setting("binance_pay_id", value)
     await state.clear()
+    await message.answer("✅ Binance Pay ID আপডেট হয়েছে।", reply_markup=admin_reply_keyboard())
 
-    update_setting(key, value)
-    await message.answer(f"✅ সফলভাবে আপডেট করা হয়েছে!", reply_markup=admin_keyboard())
-
-@router.callback_query(F.data == "admin_panel_back_to_menu")
-async def admin_panel_back_cb(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.message(DepositSettingState.waiting_rate)
+async def save_rate(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
-    await call.answer()
-    await show_admin_panel(call.message)
-
-# Admin Session Management
-@router.message(F.text == "⚙️ Manage Admin Session")
-async def admin_manage_session_text(message: Message):
-    if message.chat.id not in ADMIN_IDS:
+    try:
+        value = int((message.text or "").strip())
+        if value <= 0 or value > 10**12:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ 0-এর চেয়ে বড় পূর্ণ সংখ্যা লিখুন।")
         return
-    sessions = db.execute("SELECT * FROM admin_sessions").fetchall()
-    text = "⚙️ <b>Manage Admin Sessions</b>\n\n"
-    if sessions:
-        for s in sessions:
-            users_using = db.execute("SELECT COUNT(*) as c FROM user_admin_sessions WHERE session_id=?", (s['id'],)).fetchone()["c"]
-            text += f"🆔 ID: {s['id']} | @{s['username']} | ব্যবহারকারী: {users_using} জন\n"
-    else:
-        text += "কোনো অ্যাডমিন সেশন যুক্ত করা হয়নি。\n"
-
-    kb = [
-        [InlineKeyboardButton(text="➕ Add New Session", callback_data="admin_add_session")],
-        [InlineKeyboardButton(text="🗑 Delete Session", callback_data="admin_del_session_list")],
-        [InlineKeyboardButton(text="👥 View Session Users", callback_data="admin_view_sess_users")],
-    ]
-    await message.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data == "admin_manage_session")
-async def admin_manage_session_cb(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
-        return
-    await call.answer()
-    sessions = db.execute("SELECT * FROM admin_sessions").fetchall()
-    text = "⚙️ <b>Manage Admin Sessions</b>\n\n"
-    if sessions:
-        for s in sessions:
-            users_using = db.execute("SELECT COUNT(*) as c FROM user_admin_sessions WHERE session_id=?", (s['id'],)).fetchone()["c"]
-            text += f"🆔 ID: {s['id']} | @{s['username']} | ব্যবহারকারী: {users_using} জন\n"
-    else:
-        text += "কোনো অ্যাডমিন সেশন যুক্ত করা হয়নি。\n"
-
-    kb = [
-        [InlineKeyboardButton(text="➕ Add New Session", callback_data="admin_add_session")],
-        [InlineKeyboardButton(text="🗑 Delete Session", callback_data="admin_del_session_list")],
-        [InlineKeyboardButton(text="👥 View Session Users", callback_data="admin_view_sess_users")],
-    ]
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-
-@router.callback_query(F.data == "admin_add_session")
-async def admin_add_session_start(call: CallbackQuery, state: FSMContext):
-    if call.message.chat.id not in ADMIN_IDS:
-        return
-    await call.answer()
-    await state.set_state(AdminSessionState.waiting_username)
-    await call.message.answer("টেলিগ্রাম অ্যাকাউন্টের ইউজারনেম দিন (যেমন: @myaccount):")
-
-@router.message(AdminSessionState.waiting_username)
-async def admin_add_session_username(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
-        return
-    username = normalize_username(message.text)
-    await state.update_data(username=username)
-    await state.set_state(AdminSessionState.waiting_string)
-    await message.answer("এবার ঐ অ্যাকাউন্টের Telethon String Session দিন:")
-
-@router.message(AdminSessionState.waiting_string)
-async def admin_add_session_save(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
-        return
-    data = await state.get_data()
-    username = data.get("username")
-    session_string = message.text.strip()
-
-    db.execute("INSERT INTO admin_sessions (username, session_string, added_at) VALUES (?, ?, ?)", (username, session_string, int(time.time())))
-    db.commit()
+    set_setting("coins_per_dollar", value)
     await state.clear()
-    await message.answer(f"✅ সফলভাবে অ্যাডমিন সেশন @{username} যুক্ত করা হয়েছে!", reply_markup=admin_keyboard())
+    await message.answer("✅ Coins per dollar আপডেট হয়েছে।", reply_markup=admin_reply_keyboard())
 
-@router.callback_query(F.data == "admin_del_session_list")
-async def admin_del_session_list(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.message(DepositSettingState.waiting_minimum)
+async def save_minimum(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = float((message.text or "").strip())
+        if value <= 0 or value > 1000000:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ 0-এর চেয়ে বড় সঠিক USD পরিমাণ লিখুন।")
+        return
+    set_setting("min_deposit_usd", value)
+    await state.clear()
+    await message.answer("✅ Minimum Deposit আপডেট হয়েছে।", reply_markup=admin_reply_keyboard())
+
+@router.message(DepositSettingState.waiting_charge)
+async def save_charge(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        value = int((message.text or "").strip())
+        if value < 0 or value > 10**12:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ 0 অথবা ধনাত্মক পূর্ণ সংখ্যা লিখুন।")
+        return
+    set_setting("coins_per_minute", value)
+    await state.clear()
+    await message.answer("✅ Per-minute charge আপডেট হয়েছে।", reply_markup=admin_reply_keyboard())
+
+@router.message(F.text == "📊 User Reports")
+async def reports_text(message: Message):
+    await show_user_reports(message, message.from_user.id)
+
+@router.callback_query(F.data == "admin_reports")
+async def reports_callback(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    sessions = db.execute("SELECT * FROM admin_sessions").fetchall()
-    if not sessions:
-        await call.message.edit_text("কোনো সেশন নেই।")
+    await show_user_reports(call.message, call.from_user.id)
+
+async def show_user_reports(message, actor_id):
+    if not is_admin(actor_id):
         return
+    with db.cursor() as cur:
+        cur.execute("SELECT user_id, session_string, connected, blocked, created_at, balance, total_spent, bot_enabled, billing_seconds, billing_last_ts FROM users ORDER BY created_at DESC LIMIT 100")
+        rows = cur.fetchall()
+    if not rows:
+        await message.answer("কোনো ইউজার নেই।", reply_markup=admin_reply_keyboard())
+        return
+    await message.answer(f"📊 User Report — মোট {len(rows)} জন (সর্বোচ্চ 100 জন):", reply_markup=admin_reply_keyboard())
+    for r in rows:
+        u = {"user_id": r[0], "connected": r[2], "blocked": r[3], "balance": r[5], "total_spent": r[6], "bot_enabled": r[7]}
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT channel_type, channel_username FROM channels WHERE owner_id=%s AND active=1",
+                (u["user_id"],),
+            )
+            channels = cur.fetchall()
+        channel_text = "\n".join(f"• {c[0]}: {c[1]}" for c in channels) or "কোনো চ্যানেল নেই"
+        report = (
+            f"👤 <b>User</b>\n🆔 <code>{u['user_id']}</code>\n"
+            f"📺 Channels:\n{channel_text}\n\n"
+            f"💎 Balance: {u['balance']:,} Coins\n"
+            f"🔥 Spent: {u['total_spent']:,} Coins\n"
+            f"⏯️ Bot: {'ON' if u['bot_enabled'] else 'OFF'}\n"
+            f"📌 Status: {'BLOCKED' if u['blocked'] else 'Active'}"
+        )
+        await message.answer(report, parse_mode="HTML")
 
-    kb = []
-    for s in sessions:
-        kb.append([InlineKeyboardButton(text=f"🗑 Delete @{s['username']}", callback_data=f"del_sess_{s['id']}")])
-    await call.message.edit_text("মুছে ফেলার জন্য সেশন সিলেক্ট করুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+@router.message(F.text == "🔍 Search User")
+async def search_start_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(SearchUserState.waiting_user_id)
+    await message.answer("খোঁজার জন্য Telegram User ID দিন:")
 
-@router.callback_query(F.data.startswith("del_sess_"))
-async def admin_delete_session(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.callback_query(F.data == "admin_search")
+async def search_start_callback(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    sess_id = int(call.data.split("_")[-1])
-    db.execute("DELETE FROM admin_sessions WHERE id=?", (sess_id,))
-    db.execute("DELETE FROM user_admin_sessions WHERE session_id=?", (sess_id,))
-    db.commit()
-    await call.message.edit_text("✅ সেশন সফলভাবে মুছে ফেলা হয়েছে।", reply_markup=admin_keyboard())
+    await state.set_state(SearchUserState.waiting_user_id)
+    await call.message.answer("খোঁজার জন্য Telegram User ID দিন:")
 
-@router.callback_query(F.data == "admin_view_sess_users")
-async def admin_view_sess_users(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.message(SearchUserState.waiting_user_id)
+async def search_user_result(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    try:
+        target_id = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("❌ সঠিক User ID দিন।")
+        return
+    with db.cursor() as cur:
+        cur.execute("SELECT user_id, blocked, balance, total_spent FROM users WHERE user_id=%s", (target_id,))
+        u_row = cur.fetchone()
+    if not u_row:
+        await message.answer("❌ ইউজার পাওয়া যায়নি।", reply_markup=admin_reply_keyboard())
+        return
+    u = {"user_id": u_row[0], "blocked": u_row[1], "balance": u_row[2], "total_spent": u_row[3]}
+    with db.cursor() as cur:
+        cur.execute("SELECT channel_type,channel_username,title FROM channels WHERE owner_id=%s", (target_id,))
+        channels = cur.fetchall()
+    ctext = "\n".join(f"• {c[0]}: {c[1]} ({c[2] or 'Unknown'})" for c in channels) or "কোনো চ্যানেল নেই"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🚫 Block" if not u["blocked"] else "🔓 Unblock",
+                              callback_data=f"admin_block_{target_id}" if not u["blocked"] else f"admin_unblock_{target_id}")
+    ], [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")]])
+    await message.answer(
+        f"👤 <b>User Info</b>\n🆔 <code>{target_id}</code>\n"
+        f"📌 Status: {'Blocked' if u['blocked'] else 'Active'}\n"
+        f"📺 Channels:\n{ctext}\n💎 Balance: {u['balance']:,}\n🔥 Spent: {u['total_spent']:,}",
+        parse_mode="HTML", reply_markup=kb,
+    )
+
+@router.callback_query(F.data.startswith("admin_block_"))
+async def admin_block_user(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    rows = db.execute("SELECT uas.user_id, asess.username FROM user_admin_sessions uas JOIN admin_sessions asess ON uas.session_id = asess.id").fetchall()
-    text = "👥 <b>অ্যাডমিন সেশন ব্যবহারকারীগণ:</b>\n\n"
-    if rows:
-        for r in rows:
-            text += f"• ইউজার আইডি: <code>{r['user_id']}</code> | সেশন: @{r['username']}\n"
-    else:
-        text += "কেউ এখনো ব্যবহার করছে না。"
-    await call.message.edit_text(text, parse_mode="HTML", reply_markup=admin_keyboard())
+    uid = int(call.data.rsplit("_", 1)[1])
+    with db.cursor() as cur:
+        cur.execute("UPDATE users SET blocked=1,bot_enabled=0,billing_seconds=0,billing_last_ts=0 WHERE user_id=%s", (uid,))
+    await disconnect_client(uid)
+    await call.message.edit_text(f"🚫 User <code>{uid}</code> ব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_inline_keyboard())
 
-# Broadcast Message
+@router.callback_query(F.data.startswith("admin_unblock_"))
+async def admin_unblock_user(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    uid = int(call.data.rsplit("_", 1)[1])
+    with db.cursor() as cur:
+        cur.execute("UPDATE users SET blocked=0 WHERE user_id=%s", (uid,))
+    await call.message.edit_text(f"🔓 User <code>{uid}</code> আনব্লক করা হয়েছে।", parse_mode="HTML", reply_markup=admin_inline_keyboard())
+
+# =========================================================
+# BROADCAST / MANAGE ADMIN SESSIONS
+# =========================================================
+
 @router.message(F.text == "📢 Broadcast Message")
-async def admin_broadcast_start_text(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
+async def broadcast_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
     await state.set_state(BroadcastState.waiting_message)
-    await message.answer("সকল ব্যবহারকারীকে পাঠানোর জন্য মেসেজটি লিখুন:")
+    await message.answer("সব ইউজারকে পাঠানোর জন্য মেসেজ লিখুন:")
+
+@router.callback_query(F.data == "admin_broadcast")
+async def broadcast_callback(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    await state.set_state(BroadcastState.waiting_message)
+    await call.message.answer("সব ইউজারকে পাঠানোর জন্য মেসেজ লিখুন:")
 
 @router.message(BroadcastState.waiting_message)
-async def admin_broadcast_send(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
+async def broadcast_send(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
     text = message.text
     await state.clear()
-
-    users = db.execute("SELECT user_id FROM users").fetchall()
-    success = 0
-    failed = 0
-
-    for u in users:
+    if not text:
+        await message.answer("❌ শুধু Text broadcast সমর্থিত।")
+        return
+    with db.cursor() as cur:
+        cur.execute("SELECT user_id FROM users WHERE blocked=0")
+        rows = cur.fetchall()
+    success = failed = 0
+    for row in rows:
         try:
-            await bot.send_message(u["user_id"], text, parse_mode="HTML")
+            await bot.send_message(row[0], text, parse_mode=None)
             success += 1
             await asyncio.sleep(0.05)
         except Exception:
             failed += 1
+    await message.answer(f"📢 Broadcast Complete\nসফল: {success}\nব্যর্থ: {failed}", reply_markup=admin_reply_keyboard())
 
-    await message.answer(f"📢 <b>Broadcast Complete!</b>\n\nসফল: {success}\nব্যর্থ: {failed}", parse_mode="HTML", reply_markup=admin_keyboard())
+@router.message(F.text == "🧩 Manage Admin Session")
+async def manage_sessions_text(message: Message):
+    await show_manage_sessions(message, message.from_user.id)
 
-# Search User & Block/Unblock
-@router.message(F.text == "🔍 Search User")
-async def admin_search_start_text(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
+@router.callback_query(F.data == "admin_manage_session")
+async def manage_sessions_callback(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
-    await state.set_state(SearchUserState.waiting_user_id)
-    await message.answer("খোঁজার জন্য ইউজারের Telegram User ID দিন:")
+    await call.answer()
+    await show_manage_sessions(call.message, call.from_user.id)
 
-@router.message(SearchUserState.waiting_user_id)
-async def admin_search_result(message: Message, state: FSMContext):
-    if message.chat.id not in ADMIN_IDS:
+async def show_manage_sessions(message, actor_id):
+    if not is_admin(actor_id):
         return
-    await state.clear()
-    try:
-        target_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ সঠিক ইউজার আইডি দিন।")
-        return
-
-    user = db.execute("SELECT * FROM users WHERE user_id=?", (target_id,)).fetchone()
-    if not user:
-        await message.answer("❌ এই ইউজার আইডি ডাটাবেজে পাওয়া যায়নি।", reply_markup=admin_keyboard())
-        return
-
-    channels = db.execute("SELECT * FROM channels WHERE owner_id=?", (target_id,)).fetchall()
-    chan_text = ""
-    for c in channels:
-        chan_text += f"- {c['channel_type'].upper()}: {c['channel_username']} ({c['title']})\n"
-
-    status_str = "ব্নকড 🚫" if user["blocked"] else "অ্যাক্টিভ ✅"
-    rate = float(get_setting("rate_per_usd"))
-
-    text = (
-        f"👤 <b>User Info</b>\n\n"
-        f"🆔 ID: <code>{user['user_id']}</code>\n"
-        f"📌 Status: {status_str}\n"
-        f"💎 Balance: {user['balance']*rate:.0f} Coins\n"
-        f"💸 Spent: {user['total_spent']*rate:.0f} Coins\n"
-        f"📅 Joined: {time.strftime('%Y-%m-%d %H:%M', time.localtime(user['created_at']))}\n\n"
-        f"📺 <b>Channels:</b>\n{chan_text or 'কোনো চ্যানেল নেই'}"
-    )
-
-    block_btn_text = "🔓 Unblock User" if user["blocked"] else "🚫 Block User"
-    block_cb = f"admin_unblock_{target_id}" if user["blocked"] else f"admin_block_{target_id}"
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=block_btn_text, callback_data=block_cb)],
-        ]
-    )
+    with db.cursor() as cur:
+        cur.execute("SELECT id, username FROM admin_sessions")
+        rows = cur.fetchall()
+    text = "🧩 <b>Manage Admin Sessions</b>\n\n"
+    text += "\n".join(f"ID {r[0]}: @{r[1]}" for r in rows) if rows else "কোনো সেশন নেই।"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Add Session", callback_data="admin_add_session")],
+        [InlineKeyboardButton(text="🗑 Delete Session", callback_data="admin_del_session_list")],
+        [InlineKeyboardButton(text="👥 View Session Users", callback_data="admin_view_sess_users")],
+        [InlineKeyboardButton(text="🔙 Admin Panel", callback_data="admin_panel")],
+    ])
     await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
-@router.callback_query(F.data.startswith("admin_block_"))
-async def admin_block_user(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.callback_query(F.data == "admin_add_session")
+async def admin_add_session_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    target_id = int(call.data.split("_")[-1])
-    db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (target_id,))
-    db.commit()
-    await call.message.edit_text(f"🚫 ইউজার <code>{target_id}</code> ব্লক করা হয়েছে।", parse_mode="HTML")
+    await state.set_state(AdminSessionState.waiting_username)
+    await call.message.answer("অ্যাকাউন্টের username দিন (যেমন @myaccount):")
 
-@router.callback_query(F.data.startswith("admin_unblock_"))
-async def admin_unblock_user(call: CallbackQuery):
-    if call.message.chat.id not in ADMIN_IDS:
+@router.message(AdminSessionState.waiting_username)
+async def admin_add_session_username(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    username = normalize_username(message.text)
+    if not username or username == "@":
+        await message.answer("❌ সঠিক username দিন।")
+        return
+    await state.update_data(username=username.lstrip("@"))
+    await state.set_state(AdminSessionState.waiting_string)
+    await message.answer("String Session দিন। এটি গোপন credential—শুধু আপনার অনুমোদিত অ্যাকাউন্ট ব্যবহার করুন।")
+
+@router.message(AdminSessionState.waiting_string)
+async def admin_add_session_save(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    if not message.text or len(message.text.strip()) < 30:
+        await message.answer("❌ Session অসম্পূর্ণ।")
+        return
+    data = await state.get_data()
+    username = data.get("username", "unknown")
+    test_client = TelegramClient(StringSession(message.text.strip()), API_ID, API_HASH)
+    try:
+        await test_client.connect()
+        if not await test_client.is_user_authorized():
+            await message.answer("❌ Session authorized নয়; সংরক্ষণ করা হয়নি।")
+            return
+        me = await test_client.get_me()
+        username = (me.username or username).lstrip("@")
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO admin_sessions(username,session_string,added_at) VALUES(%s,%s,%s)",
+                (username, message.text.strip(), int(time.time())),
+            )
+        await state.clear()
+        with suppress(Exception):
+            await message.delete()
+        await message.answer(f"✅ Admin Session @{username} যোগ হয়েছে।", reply_markup=admin_reply_keyboard())
+    except Exception:
+        logger.exception("Admin session validation failed")
+        await message.answer("❌ Session যাচাই করা যায়নি।")
+    finally:
+        with suppress(Exception):
+            await test_client.disconnect()
+
+@router.callback_query(F.data == "admin_del_session_list")
+async def admin_del_session_list(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
         return
     await call.answer()
-    target_id = int(call.data.split("_")[-1])
-    db.execute("UPDATE users SET blocked=0 WHERE user_id=?", (target_id,))
-    db.commit()
-    await call.message.edit_text(f"🔓 ইউজার <code>{target_id}</code> আনব্লক করা হয়েছে।", parse_mode="HTML")
+    with db.cursor() as cur:
+        cur.execute("SELECT id, username FROM admin_sessions")
+        rows = cur.fetchall()
+    if not rows:
+        await call.message.answer("কোনো Admin Session নেই।", reply_markup=admin_inline_keyboard())
+        return
+    kb = [[InlineKeyboardButton(text=f"🗑 Delete @{r[1]}", callback_data=f"del_sess_{r[0]}")] for r in rows]
+    kb.append([InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_session")])
+    await call.message.answer("মুছতে সেশন নির্বাচন করুন:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-=========================================================
-FLASK WEB SERVER & KEEP-ALIVE
-=========================================================
+@router.callback_query(F.data.startswith("del_sess_"))
+async def admin_delete_session(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    sid = int(call.data.rsplit("_", 1)[1])
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM admin_sessions WHERE id=%s", (sid,))
+        cur.execute("DELETE FROM user_admin_sessions WHERE session_id=%s", (sid,))
+    for uid in list(clients.keys()):
+        if not is_connected_user(uid) and not has_admin_session(uid):
+            await disconnect_client(uid)
+    await call.message.edit_text("✅ Session মুছে ফেলা হয়েছে।", reply_markup=admin_inline_keyboard())
+
+@router.callback_query(F.data == "admin_view_sess_users")
+async def admin_view_sess_users(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Access denied", show_alert=True)
+        return
+    await call.answer()
+    with db.cursor() as cur:
+        cur.execute(
+            """SELECT uas.user_id, a.username FROM user_admin_sessions uas
+            JOIN admin_sessions a ON a.id=uas.session_id ORDER BY uas.user_id"""
+        )
+        rows = cur.fetchall()
+    text = "👥 <b>Admin Session ব্যবহারকারী</b>\n\n"
+    text += "\n".join(f"• <code>{r[0]}</code> — @{r[1]}" for r in rows) if rows else "কেউ ব্যবহার করছে না।"
+    await call.message.answer(text, parse_mode="HTML", reply_markup=admin_inline_keyboard())
+
+# =========================================================
+# WEB SERVER / KEEP-ALIVE
+# =========================================================
 
 web_app = Flask(__name__)
 
-@web_app.route('/')
+@web_app.route("/")
 def home():
-    return "Telegram Auto Speaker & SMM Engine: ACTIVE 24/7"
+    return "Telegram Auto Speaker: ACTIVE"
 
 def ping_self():
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "https://telegram-auto-speaker-1.onrender.com")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").strip()
+    if not render_url:
+        return
     while True:
         try:
             time.sleep(280)
             requests.get(render_url, timeout=10)
-            logger.info("📡 Keeping bot server active 24/7...")
-        except Exception as e:
-            logger.warning(f"Self Ping Warning: {e}")
+            logger.info("Keep-alive ping sent")
+        except Exception as exc:
+            logger.warning("Self ping warning: %s", exc)
 
 def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    web_app.run(host='0.0.0.0', port=port, use_reloader=False)
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", PORT)), use_reloader=False)
 
 def keep_alive():
-    t_web = Thread(target=run_web)
-    t_web.daemon = True
-    t_web.start()
+    Thread(target=run_web, daemon=True).start()
+    if os.environ.get("RENDER_EXTERNAL_URL", "").strip():
+        Thread(target=ping_self, daemon=True).start()
 
-    t_ping = Thread(target=ping_self)
-    t_ping.daemon = True
-    t_ping.start()
-
-=========================================================
-MAIN
-=========================================================
+# =========================================================
+# MAIN
+# =========================================================
 
 async def main():
     logger.info("Telegram Auto Speaker starting...")
-
     keep_alive()
     monitor_task = asyncio.create_task(auto_monitor())
-
     try:
         await dp.start_polling(bot)
     finally:
         monitor_task.cancel()
         with suppress(asyncio.CancelledError):
             await monitor_task
-
-        for user_id in list(clients.keys()):
-            await disconnect_client(user_id)
-
+        for uid in list(clients.keys()):
+            await disconnect_client(uid)
         await bot.session.close()
         db.close()
 
