@@ -773,7 +773,7 @@ async def process_string_session(message: Message, state: FSMContext):
         await message.answer("❌ কানেক্ট করা যায়নি। Session, API_ID ও API_HASH যাচাই করুন।")
 
 # =========================================================
-# ADMIN SESSION SELECTOR (legacy feature)
+# ADMIN SESSION SELECTOR (Updated for everyone)
 # =========================================================
 
 @router.message(F.text == "🤖 Admin Session")
@@ -796,7 +796,7 @@ async def show_admin_session_menu(message: Message):
     kb = [[InlineKeyboardButton(text=f"📱 @{s[1]}", callback_data=f"use_admin_sess_{s[0]}")] for s in sessions]
     kb.append([InlineKeyboardButton(text="🔙 Main Menu", callback_data="main_menu_back")])
     await message.answer(
-        "নিচের তালিকা থেকে সেশন নির্বাচন করুন। শুধুমাত্র যথাযথ অনুমতি থাকা সেশন ব্যবহার করুন:",
+        "নিচের তালিকা থেকে সেশন নির্বাচন করুন:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
 
@@ -816,6 +816,7 @@ async def select_admin_session(call: CallbackQuery):
             ON CONFLICT(user_id) DO UPDATE SET session_id=EXCLUDED.session_id,created_at=EXCLUDED.created_at""",
             (uid, sid, int(time.time())),
         )
+        cur.execute("UPDATE users SET connected=0 WHERE user_id=%s", (uid,))
     await disconnect_client(uid)
     await call.message.answer(f"✅ Admin Session নির্বাচিত: @{row[1]}", reply_markup=user_keyboard(uid))
 
@@ -843,7 +844,7 @@ async def target_start(message: Message, state: FSMContext):
     old = get_channel(uid, "target")
     await message.answer(
         ("🎯 বর্তমান Target: " + f"{old['title']} ({old['channel_username']})\n" if old else "")
-        + "Target Channel-এর public username পাঠান, যেমন @MyTargetChannel"
+        + "Target Channel-এর লিংক অথবা username পাঠান, যেমন @MyTargetChannel বা https://t.me/MyTargetChannel"
     )
     await state.set_state(TargetChannelState.waiting_channel)
 
@@ -867,15 +868,15 @@ async def live_start(message: Message, state: FSMContext):
     old = get_channel(uid, "live")
     await message.answer(
         ("📺 বর্তমান Live: " + f"{old['title']} ({old['channel_username']})\n" if old else "")
-        + "Live Stream Channel-এর public username পাঠান, যেমন @MyLiveChannel"
+        + "Live Stream Channel-এর লিংক অথবা username পাঠান, যেমন @MyLiveChannel বা https://t.me/MyLiveChannel"
     )
     await state.set_state(LiveChannelState.waiting_channel)
 
 def normalize_username(value):
     value = (value or "").strip()
-    for prefix in ("https://t.me/", "http://t.me/"):
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
         if value.startswith(prefix):
-            value = value[len(prefix):].split("/", 1)[0]
+            value = value[len(prefix):].split("/", 1)[0].split("?", 1)[0]
             break
     if value and not value.startswith("@"):
         value = "@" + value
@@ -893,7 +894,7 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
     uid = message.chat.id
     username = normalize_username(message.text)
     if not username or username == "@":
-        await message.answer("❌ সঠিক public Channel username দিন, যেমন @MyChannel")
+        await message.answer("❌ সঠিক Channel লিংক অথবা username দিন, যেমন @MyChannel")
         return
     try:
         client = await ensure_client(uid)
@@ -921,7 +922,7 @@ async def save_channel(message: Message, state: FSMContext, channel_type: str):
     except Exception:
         logger.exception("Channel setup failed: user=%s type=%s", uid, channel_type)
         await state.clear()
-        await message.answer("❌ Channel যোগ করা যায়নি। Username ও account access যাচাই করুন।")
+        await message.answer("❌ Channel যোগ করা যায়নি। Username বা লিংক ও account access যাচাই করুন।")
 
 # =========================================================
 # LIVE CALL HELPERS (Optimized & Limit Increased)
