@@ -1,6 +1,5 @@
-aiogram>=3.0.0
-telethon>=1.34.0
-psycopg2-binary>=2.9.0
-python-dotenv>=1.0.0
-flask>=3.0.0
-requests>=2.31.0
+aiogram
+telethon
+python-dotenv
+requests
+Flask
